@@ -1,4 +1,4 @@
-#include "server/log.hpp"
+#include "net/log.hpp"
 
 #include <iostream>
 
@@ -21,8 +21,8 @@ Logger& Logger::instance(){
 }
 
 void Logger::do_log(Level lv, const std::string& msg){
+    if(lv < level_) return;      // 低于当前级别 → 丢弃（set_level 才真正生效）
     std::cout << msg << '\n';
-    (void)lv;
 }
 
 void Logger::set_level(Level lv){

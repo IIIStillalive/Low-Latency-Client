@@ -9,11 +9,19 @@ EventLoopThread::EventLoopThread()
 
 EventLoopThread::~EventLoopThread() {
     exiting_ = true;
-    if (loop_ != nullptr) {
-        loop_->quit(); // 假设你的 EventLoop 有一个 quit 方法退出循环
-        if (thread_.joinable()) {
-            thread_.join();
-        }
+    // 带锁读 loop_ 再 quit：子线程退出前会在锁内置 loop_=nullptr（threadFunc 收尾），
+    // 因此「读到非空」= 子线程尚未走到销毁 loop 那一步 → quit() 一定打在仍存活的 loop 上；
+    // 直接无锁读可能拿到 stale 指针，指向子线程栈上已析构的 EventLoop → 写已释放内存 = UAF。
+    EventLoop* loop = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        loop = loop_;
+    }
+    if (loop != nullptr) {
+        loop->quit(); // 唤醒子线程停机（若已在退出则无害）；join 保证销毁完成
+    }
+    if (thread_.joinable()) {
+        thread_.join();
     }
 }
 void EventLoopThread::quit() {

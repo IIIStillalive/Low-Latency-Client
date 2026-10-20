@@ -2,9 +2,9 @@
 
 #include <cstdint>
 
-#include "server/buffer.hpp"
+#include "net/buffer.hpp"
 #include "server/tcp_connnection.hpp"   // TcpConnection::send 需完整类型
-#include "server/log.hpp"
+#include "net/log.hpp"
 
 namespace server{
 

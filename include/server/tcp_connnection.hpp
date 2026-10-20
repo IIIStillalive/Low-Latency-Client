@@ -3,11 +3,11 @@
 #include <functional>
 #include <memory>
 
-#include "buffer.hpp"
+#include "net/buffer.hpp"
 
-#include "channel.hpp"
-#include "socket.hpp"
-#include "timer.hpp"   // TimerId：closeTimerId_ 归属类型
+#include "net/channel.hpp"
+#include "net/socket.hpp"
+#include "net/timer.hpp"   // TimerId：closeTimerId_ 归属类型
 namespace server{
 
 class Buffer;
@@ -29,6 +29,7 @@ public:
     // 预留回调接口：连接关闭时通知所有者(main)把我释放；所有权属于外部
     void setCloseCallback(std::function<void(TcpConnection*)> cb);
     void send(const void* data, size_t n);   // public：业务侧发送入口
+    void close();                        // 主动断开：走 handleClose 完整关闭链（下树+cancel心跳+通知owner）
     using MessageCallback = std::function<void(TcpConnection*, Buffer*)>;
     void setMessageCallback(MessageCallback cb);   // 业务层挂钩：onRead 读到的字节交给它解析
     void setConnectionTimeout(double seconds);     // 启动空闲超时：超时未收发数据则主动断开

@@ -1,8 +1,8 @@
 #include "tcpserver.hpp"
 
 #include <functional>         // std::bind
-#include "server/log.hpp"
-#include "server/event_loop.hpp"  // EventLoop 完整定义：runInLoop/runloop 需完整类型
+#include "net/log.hpp"
+#include "net/event_loop.hpp"  // EventLoop 完整定义：runInLoop/runloop 需完整类型
 
 namespace server{
 

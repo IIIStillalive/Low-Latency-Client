@@ -6,11 +6,11 @@
 #include <sys/socket.h>  // socket/bind/listen/setsockopt
 #include <unistd.h>
 
-#include "server/errno.hpp"
-#include "server/log.hpp"
+#include "net/errno.hpp"
+#include "net/log.hpp"
 
 // 需要 EventLoop 完整类型：listen() 里 ch_.enablereading() → update() → loop_->updatachannel(this)
-#include "server/event_loop.hpp"
+#include "net/event_loop.hpp"
 
 namespace server{
 

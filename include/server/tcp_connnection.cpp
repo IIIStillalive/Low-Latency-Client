@@ -2,9 +2,9 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include "server/log.hpp"
+#include "net/log.hpp"
 #include <thread>
-#include "server/event_loop.hpp"  // EventLoop 完整定义：listenconnection() 里调 loop_->updatachannel
+#include "net/event_loop.hpp"  // EventLoop 完整定义：listenconnection() 里调 loop_->updatachannel
 
 namespace server{
 
@@ -136,6 +136,10 @@ void TcpConnection::checkIdle(){
     } else {
         timeoutTimerId_ = loop_->runAfter(1.0, [this]{ checkIdle(); });  // 未超时 → 再等一秒
     }
+}
+void TcpConnection::close(){
+    std::shared_ptr<TcpConnection> keep = shared_from_this();  // 保活：close 链可能触发 owner 释放最后一个引用
+    handleClose();
 }
 void TcpConnection::handleClose(){
     if(closed_) return;                  // 防重复关闭（HUP 可能会触达多次）

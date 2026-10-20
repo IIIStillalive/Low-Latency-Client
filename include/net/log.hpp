@@ -3,7 +3,7 @@
 #include <sstream>
 #include <utility>
 #include <string>
-#include "server/noncopyable.hpp"
+#include "net/noncopyable.hpp"
 namespace server
 {
 

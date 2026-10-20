@@ -5,8 +5,8 @@
 #include <netinet/in.h>     // sockaddr_in
 #include <arpa/inet.h>      // htons/htonl
 
-#include "server/log.hpp"
-#include "server/event_loop.hpp"
+#include "net/log.hpp"
+#include "net/event_loop.hpp"
 #include "server/tcpserver.hpp"
 
 using namespace server;

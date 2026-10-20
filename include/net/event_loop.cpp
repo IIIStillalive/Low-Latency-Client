@@ -41,6 +41,7 @@ void EventLoop::removechannel(Channel* ch){
 }
 void EventLoop::runloop(){
     while(!quit_){
+        readys.clear();          // 清空上一批：否则被摘除/销毁的 Channel* 残留批中，下一批 handleback 会成为 UAF
         poller_->poll(-1, readys);
         for(auto& it : readys){
             it->handleback();  //为就绪fd调用回调

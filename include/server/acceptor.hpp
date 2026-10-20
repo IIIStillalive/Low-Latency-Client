@@ -3,8 +3,8 @@
 #include <functional>
 #include <netinet/in.h>   // struct sockaddr_in
 
-#include "channel.hpp"
-#include "socket.hpp"
+#include "net/channel.hpp"
+#include "net/socket.hpp"
 
 namespace server{
 

@@ -6,9 +6,9 @@
 #include <sys/errno.h>
 #include <algorithm>
 
-#include "server/event_loop.hpp"   // EventLoop 完整定义：handleRead 里调 loop_->updatachannel 等
-#include "server/log.hpp"
-#include "server/errno.hpp"        // ErrnoGuard：错误描述
+#include "net/event_loop.hpp"   // EventLoop 完整定义：handleRead 里调 loop_->updatachannel 等
+#include "net/log.hpp"
+#include "net/errno.hpp"        // ErrnoGuard：错误描述
 
 namespace server {
 
