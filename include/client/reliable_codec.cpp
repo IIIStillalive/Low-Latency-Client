@@ -36,36 +36,47 @@ void ReliableCodec::setDeliveryLoop(EventLoop* deliveryLoop, size_t queueLimit){
 
 // 发：任意线程可调。业务线程（异步回调现场）→ runInLoop 转 IO 线程执行。
 void ReliableCodec::sendData(TcpConnection* conn, const void* body, size_t n){
+    sendFrame(conn, MsgType::Data, body, n);
+}
+
+void ReliableCodec::sendFrame(TcpConnection* conn, MsgType type, const void* body, size_t n){
     if(loop_ == nullptr || body == nullptr || n == 0) return;   // 空载拒绝：不烧 seq
     if(loop_->isInLoopThread()){
-        conn_ = conn;                  // Day3 直接路径保持《目标 = 入参 conn》语义（self-heal）
-        sendDataInLoop(std::string(static_cast<const char*>(body), n), conn);
+        if(conn != nullptr) conn_ = conn;   // Day3 直接路径保持《目标 = 入参 conn》语义（self-heal）
+        // conn == nullptr = 「发往当前活动连接」：不动 conn_（RPC 层在 IO 线程内发帧用这条）
+        sendFrameInLoop(type, std::string(static_cast<const char*>(body), n), conn);
         return;
     }
     // 跨线程（Day4-B）：目标权威 = 当前活动连接 connRef_（持有引用防止任务执行前被析构）
     std::shared_ptr<TcpConnection> target = connRef_;
     loop_->runInLoop(
-        [this, body = std::string(static_cast<const char*>(body), n),
+        [this, type, body = std::string(static_cast<const char*>(body), n),
          target = std::move(target)]() mutable {
-            sendDataInLoop(std::move(body), target.get());
+            sendFrameInLoop(type, std::move(body), target.get());
         });
 }
 
-void ReliableCodec::sendDataInLoop(const std::string& body, TcpConnection* intended){
+void ReliableCodec::sendFrame(MsgType type, const void* body, size_t n){
+    sendFrame(nullptr, type, body, n);
+}
+
+void ReliableCodec::sendFrameInLoop(MsgType type, const std::string& body, TcpConnection* intended){
     uint32_t seq = nextSeq_++;         // 自动序号：调用方不再手传
     PendingFrame pf;
+    pf.type   = type;                  // Day5：重传/重连重发按原类型发回
     pf.body   = body;
     pf.sentUs = nowMicros();
     pf.bornUs = pf.sentUs;           // TTL 起点：入队时刻，不随重发刷新
     pf.retries = 0;
     pending_[seq] = std::move(pf);
-    Logger::instance().log(Level::DEBUG, "[rel] send seq=", seq, " body=\"", body, "\"");
+    Logger::instance().log(Level::DEBUG, "[rel] send type=", static_cast<int>(type),
+                           " seq=", seq, " bodyLen=", body.size());
     enforceMaxFrames();                // Day4-A1：超上限先抛最旧 + LOST
-    // 发送目标校验：intended 空（直接路径 = 入参 conn）或等于当前 conn_ 才上线；
+    // 发送目标校验：intended 空（发往当前活动连接）或等于当前 conn_ 才上线；
     // 否则（连接已换代/断开期调用）只入 pending_ —— onConnected 全量重发兜底（A1 咬合）。
     const bool targetCurrent = (conn_ != nullptr) && (intended == nullptr || intended == conn_);
     if(targetCurrent){
-        proto_.sendFrame(conn_, MsgType::Data, seq, body.data(), body.size());
+        proto_.sendFrame(conn_, type, seq, body.data(), body.size());
     } else {
         Logger::instance().log(Level::INFO, "ReliableCodec park seq=", seq,
                                " no current conn (reconnect resend covers)");
@@ -83,8 +94,8 @@ void ReliableCodec::onFrame(TcpConnection* conn, MsgType type, uint32_t seq, con
                                " erased=", erased, " pendAfter=", pending_.size());
         return;
     }
-    if(type == MsgType::Data){
-        // 有符号差值判新旧（防 uint32 回绕）：旧帧 = 重传重复，不回业务但仍需回 Ack
+    if(type == MsgType::Data || type == MsgType::Request){
+        // 有序请求流：有符号差值判新旧（防 uint32 回绕）。旧帧 = 重传重复，不回业务但仍需回 Ack
         // （对方可能在等我们的确认）；新帧才更新 lastRecvSeq_ 并交业务。
         if(static_cast<int64_t>(seq) - static_cast<int64_t>(lastRecvSeq_) > 0){
             lastRecvSeq_ = seq;
@@ -94,6 +105,9 @@ void ReliableCodec::onFrame(TcpConnection* conn, MsgType type, uint32_t seq, con
         }
         proto_.sendAck(conn, seq);     // 自动回 Ack
     }
+    // Response/Cancel：RPC 响应可能乱序（服务端多 worker/延迟返回），单调 seq 判旧会把
+    // 后到的早响应误当重复帧丢掉 —— 明确绕过去重与自动 Ack。响应可靠性由「请求断线重发 +
+    // 服务端 reqId 缓存重放」覆盖；重复响应由 RpcCodec 的 inflight 表幂等丢弃。
     if(!messageCallback_) return;
     if(asyncEnabled_ && deliveryQueue_){
         // Day4-B 异步：入队业务帧 + 唤醒业务 loop（轻活留在 IO 线程；背压交给有界队列）
@@ -148,7 +162,7 @@ void ReliableCodec::onConnected(TcpConnection* conn){
         f.retries = 0;
         f.sentUs  = now;
         Logger::instance().log(Level::INFO, "ReliableCodec resend-on-reconnect seq=", kv.first);
-        proto_.sendFrame(conn_, MsgType::Data, kv.first, f.body.data(), f.body.size());
+        proto_.sendFrame(conn_, f.type, kv.first, f.body.data(), f.body.size());
     }
     ensureTick();
 }
@@ -239,7 +253,7 @@ void ReliableCodec::tick(){           // [loop 线程] runEvery 驱动
         ++f.retries;
         f.sentUs = now;                                          // 重发：更新时间，重新计超时
         Logger::instance().log(Level::INFO, "ReliableCodec retransmit seq=", it->first, " attempt=", f.retries);
-        proto_.sendFrame(conn_, MsgType::Data, it->first, f.body.data(), f.body.size());
+        proto_.sendFrame(conn_, f.type, it->first, f.body.data(), f.body.size());
         ++it;
     }
 }

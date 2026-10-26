@@ -85,10 +85,18 @@ public:
     // IO 线程执行；发送目标 = 当前活动连接 connRef_（断开期间只入 pending_，重连重发兜底）。
     void sendData(TcpConnection* conn, const void* body, size_t n);
 
+    // Day5：带帧类型的可靠发送（Request/Cancel 等 RPC 帧复用同一套 seq/Ack/重传/断线重发）。
+    // 帧类型随 pending 一起缓存 —— 重传与重连重发必须用原类型发回，否则协议语义就变了。
+    //   sendFrame(conn, type, ...)  显式目标（同 sendData 的 conn 语义）
+    //   sendFrame(type, ...)        发往「当前活动连接」，连接断开期间只入 pending_
+    void sendFrame(TcpConnection* conn, MsgType type, const void* body, size_t n);
+    void sendFrame(MsgType type, const void* body, size_t n);
+
     // 收：由 ProtocolCodec 的消息回调驱动。[IO 线程，同步模式与异步模式的公共轻活]
-    //   Ack           → 匹配 pending_ 移除；
-    //   Data(新 seq)  → 回 Ack + 交业务；
-    //   Data(旧 seq)  → 丢但回 Ack（重传重复帧不回业务）；
+    //   Ack            → 匹配 pending_ 移除；
+    //   Data/Request   → 有序请求流：新 seq 回 Ack + 交业务，旧 seq 只回 Ack（重传重复帧）；
+    //   Response/Cancel→ RPC 响应类：可能乱序到达，**不做单调 seq 去重、不回 Ack**，
+    //                    直接交业务；重复/迟到响应由 RpcCodec 按 req_id 幂等丢弃；
     //   Heartbeat/Quit → 交业务（不涉可靠）。
     //   交业务两条路径：同步模式 messageCallback_ 直调（Day3 默认）；
     //                 异步模式（setDeliveryLoop）→ enqueue 业务队列 + 唤醒业务 loop
@@ -109,6 +117,7 @@ public:
 
 private:
     struct PendingFrame {
+        MsgType     type = MsgType::Data;   // Day5：重传/重连重发必须用原帧类型
         std::string body;      // 原始 body（重传时重新打包 5B 头，帧头永远由协议层造）
         int64_t     sentUs;    // 最近一次发送时刻（微秒）
         int64_t     bornUs;    // 入队时刻（微秒）：TTL 兜底的计时起点，不随重发刷新
@@ -131,7 +140,8 @@ private:
                       uint32_t seq, std::string body);   // [IO 线程] 入队 + 精准唤醒一次
     void drainDelivery();                            // [delivery loop 线程] 弹空一批交业务
 
-    void sendDataInLoop(const std::string& body, TcpConnection* intended);  // [IO 线程] 发送主体
+    void sendFrameInLoop(MsgType type, const std::string& body,
+                         TcpConnection* intended);   // [IO 线程] 发送主体
 
     ProtocolCodec& proto_;
     EventLoop* loop_;

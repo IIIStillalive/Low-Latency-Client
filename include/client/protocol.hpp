@@ -28,6 +28,10 @@ enum class MsgType : uint8_t {
     Ack       = 0x02,   // 确认收到某 seq（seq 字段 = 被确认的那条消息号），body 空
     Data      = 0x03,   // 用户数据，body = 透传内容
     Quit      = 0x04,   // 主动下线告别帧，body 空
+    // ---- Day5 RPC：body = protobuf（proto/rpc.proto）----
+    Request   = 0x05,   // RpcRequest；有序请求流，走可靠层去重 + 自动 Ack
+    Response  = 0x06,   // RpcResponse；可能乱序，按 req_id 关联，不做单调 seq 去重
+    Cancel    = 0x07,   // RpcRequest(req_id 单字段)；best-effort 取消，服务端只 Ack
 };
 
 // 私有协议编解码层：夹在 LengthHeaderCodec 与业务回调之间

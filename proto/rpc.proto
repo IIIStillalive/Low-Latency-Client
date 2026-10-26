@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package rpc;
+
+// RPC 层线格式（body 部分）
+//
+// 帧头仍是 5B [1B type][4B seq]，由 ProtocolCodec 负责：
+//   seq    = 可靠层传输序号（ReliableCodec 分配，用于 Ack/重传/去重）
+//   req_id = RPC 层关联键（RpcCodec 分配，用于 Future ↔ 响应匹配）
+// 两者生命周期/职责不同，所以 req_id 放在消息体内，不占帧头。
+
+// 请求：客户端 → 服务端
+message RpcRequest {
+  uint32 req_id     = 1;  // 关联键；断线重发时保持不变（端到端幂等依据）
+  string method     = 2;  // 方法名（demo：echo / sleep / fail / idem）
+  bytes  payload    = 3;  // 业务参数（透传，demo 用 UTF-8 文本）
+  bool   idempotent = 4;  // 允许服务端按 req_id 缓存响应并重放
+}
+
+// 响应：服务端 → 客户端（可能乱序到达）
+message RpcResponse {
+  uint32 req_id  = 1;  // 回填请求的 req_id
+  int32  status  = 2;  // 对应 RpcStatus 枚举值（0 = Ok）
+  bytes  payload = 3;  // 业务返回值
+  string error   = 4;  // 非 Ok 时的错误描述
+}
