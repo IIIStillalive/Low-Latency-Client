@@ -57,11 +57,22 @@ public:
     ~RpcCodec() = default;
 
     // 背压闸：in-flight 上限（默认 1024）；超限 fail-fast 返回 ResourceExhausted。
-    void setMaxInflight(size_t n){ maxInflight_ = n; }
+    // 任意线程可调、运行期即时生效：IO 线程每处理一个 call 读一次原子快照，
+    // 因此可以在测试/运维中动态收紧或放宽（不要求先 start()）。
+    void setMaxInflight(size_t n){ maxInflight_.store(n, std::memory_order_relaxed); }
 
     // 共享 req_id 分配器：连接池内所有连接共用一个计数器，保证跨连接唯一
     // （服务端幂等缓存以 req_id 为键）。不调用则使用本实例内部计数器。
     void setReqIdSequence(std::shared_ptr<std::atomic<uint32_t>> seq){ reqIdSeq_ = std::move(seq); }
+
+    // req_id 分配器工厂：起点取进程启动时的随机值。
+    // 为什么不能从 1 开始：服务端按 req_id 缓存响应（断线重发时重放），若每个客户端
+    // 进程都从 1 计数，进程重启后发出的请求会命中**上一个实例**留下的缓存响应，
+    // 拿到的可能是几百毫秒前另一次调用的结果（Day6 压测三连跑实测踩到：第二次运行
+    // 的 sleep(300) 被服务端立刻重放，in-flight 不累积、背压与取消全部失效）。
+    // 随机起点 + 进程内递增号段，使不同实例、同一进程内不同池/连接的 req_id 区间不相交。
+    // 注意：32 位空间只能给出概率性保证；需要严格唯一时把 req_id 升到 64 位（改 proto）。
+    static std::shared_ptr<std::atomic<uint32_t>> makeReqIdSequence();
 
     // 发起调用（任意线程）。返回的 Future 已完成时也可安全 then()。
     RpcFuture call(const std::string& method, const std::string& payload,
@@ -97,7 +108,7 @@ private:
     std::unordered_map<uint32_t, InflightCall> inflight_;   // 仅 IO 线程读写
     std::atomic<size_t> inflightCount_{0};
 
-    size_t maxInflight_ = 1024;
+    std::atomic<size_t> maxInflight_{1024};   // 任意线程写（setMaxInflight）、IO 线程读
     bool   stopped_     = false;   // 仅 IO 线程写（stop() 在 loop 停止后调用）
 
     std::atomic<uint64_t> calls_{0}, ok_{0}, timeouts_{0}, cancelled_{0},

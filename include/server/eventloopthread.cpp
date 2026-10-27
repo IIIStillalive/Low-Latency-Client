@@ -35,6 +35,12 @@ void EventLoopThread::quit() {
         loop->quit(); // 核心：调用 EventLoop 的 quit，将其退出标志置为 true，并 wakeup
     }
 }
+void EventLoopThread::join() {
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+}
+
 EventLoop* EventLoopThread::startLoop() {
     // 启动底层线程，绑定成员函数 threadFunc
     thread_ = std::thread(&EventLoopThread::threadFunc, this);

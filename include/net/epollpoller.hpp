@@ -2,11 +2,13 @@
 
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <cerrno>
 #include <unordered_map>
 #include <vector>
 
 #include "channel.hpp"
 #include "poller.hpp"
+#include "net/log.hpp"   // epoll_ctl 失败曾静默 return false：注册失败会让 Channel 永久收不到事件
 
 
 
@@ -53,6 +55,8 @@ bool Epollpoller::updatechannel(Channel* ch){
     auto it = conns.find(ev.data.fd);
     int op = (it == conns.end()) ? EPOLL_CTL_ADD : EPOLL_CTL_MOD; //判断是否已经在连接中
     if(::epoll_ctl(epfd_, op, ch->fd(), &ev) < 0){
+        Logger::instance().log(Level::ERROR, "epoll_ctl() failed op=", op,
+                               " fd=", ch->fd(), " errno=", errno);
         return false;
     }
     conns.emplace(ch->fd(), ch);

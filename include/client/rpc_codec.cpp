@@ -1,5 +1,7 @@
 #include "client/rpc_codec.hpp"
 
+#include <chrono>
+#include <random>
 #include <utility>
 
 #include "rpc.pb.h"                 // protoc 生成（build/generated，CMake 目标 rpc_proto）
@@ -9,11 +11,33 @@
 
 namespace server {
 
+namespace {
+// 进程内每新建一个分配器就跳过 1M 个号段：同一进程里的连接池 / 独立 RpcCodec 不会撞号。
+constexpr uint32_t kReqIdStride = 1u << 20;
+
+uint32_t randomReqIdBase(){
+    // magic static：进程内只做一次随机化；之后每次调用取一个新号段的起点。
+    static std::atomic<uint32_t> cursor{[]{
+        std::random_device rd;
+        uint64_t mix = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+        // 时间再搅一次：部分平台的 random_device 会退化成固定序列
+        mix ^= static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        return static_cast<uint32_t>(mix ^ (mix >> 32));
+    }()};
+    return cursor.fetch_add(kReqIdStride, std::memory_order_relaxed);
+}
+} // namespace
+
+std::shared_ptr<std::atomic<uint32_t>> RpcCodec::makeReqIdSequence(){
+    return std::make_shared<std::atomic<uint32_t>>(randomReqIdBase());
+}
+
 RpcCodec::RpcCodec(ReliableCodec& rel, EventLoop* ioLoop, EventLoop* bizLoop)
     : rel_(rel),
       ioLoop_(ioLoop),
       bizLoop_(bizLoop),
-      reqIdSeq_(std::make_shared<std::atomic<uint32_t>>(1)) {}
+      reqIdSeq_(makeReqIdSequence()) {}
 
 RpcFuture RpcCodec::call(const std::string& method, const std::string& payload,
                          const RpcCallOptions& opts){
@@ -51,7 +75,7 @@ void RpcCodec::startCallInLoop(uint32_t reqId, std::string body,
         fut.complete(RpcResult{RpcStatus::Unavailable, "", "client stopped"});
         return;
     }
-    if(inflight_.size() >= maxInflight_){               // 背压闸：fail-fast，不阻塞调用线程
+    if(inflight_.size() >= maxInflight_.load(std::memory_order_relaxed)){   // 背压闸：fail-fast，不阻塞调用线程
         exhausted_.fetch_add(1);
         Logger::instance().log(Level::WARN, "[rpc] inflight full (", inflight_.size(),
                                "), reject req=", reqId);

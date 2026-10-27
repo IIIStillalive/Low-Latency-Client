@@ -32,8 +32,11 @@ TimerQueue::~TimerQueue(){
 TimerId TimerQueue::addTimer(TimerCallback cb, int64_t expiry, int64_t interval){
     auto* t = new Timer(std::move(cb), expiry, interval, ++nextSequence_);   // 所有权归 TimerQueue
     timers_.insert(t);
-    // 只有比 timerfd 当前更早才需重设（earliestExpiry_==0 表示还没设定过）
-    if(expiry < earliestExpiry_ || earliestExpiry_ == 0)
+    // 只有比 timerfd 当前更早才需重设（earliestExpiry_==0 表示还没设定过）。
+    // 再加一条：记录的到期时刻若已过去（到期但尚未被 handleRead 取走，timerfd 此时
+    // 可能已被内核自动解除定时），也强制重设一次 —— 否则 earliestExpiry_ 会停在旧值，
+    // 后续到期更晚的定时器全被这个判断跳过，该 loop 的定时功能就此永久失联。
+    if(expiry < earliestExpiry_ || earliestExpiry_ <= nowMicros())
         resetTimerfd();
     return t->sequence();
 }
@@ -94,7 +97,11 @@ void TimerQueue::resetTimerfd(){
     if(!timers_.empty()){
         int64_t earliest = (*timers_.begin())->expiry();
         int64_t now = nowMicros();
-        int64_t diff = (earliest > now) ? (earliest - now) : 0;
+        int64_t diff = earliest - now;
+        // timerfd 语义：it_value==0 表示**解除定时**，不是「立即到期」。
+        // 到期时刻已过（diff<=0）时必须兜底成 1µs：一旦写入 0，这个 timerfd 就再也不会
+        // 触发，而 earliestExpiry_ 仍留着旧值，后续定时器会被 addTimer 的判断永久跳过。
+        if(diff <= 0) diff = 1;
         its.it_value.tv_sec  = diff / 1000000;
         its.it_value.tv_nsec = (diff % 1000000) * 1000;
         earliestExpiry_ = earliest;

@@ -16,6 +16,13 @@ public:
     EventLoop* startLoop();
     void quit();
 
+    // 仅等待线程自然退出，**不**主动置 quit。
+    // 用途：让 loop 线程自己以 runAfter(...→ quit) 引导退出时，调用方只负责 join；
+    //   直接 reset 本对象会先 quit() 提前置位，把尚未到期的定时器任务截断
+    //   （RpcChannelPool 的连接析构就排在这样一条定时器里）。
+    // 幂等：已 join 过则立即返回；建议只在创建本对象的线程调用。
+    void join();
+
 private:
     void threadFunc(); // 线程的入口函数
 

@@ -21,12 +21,13 @@ Logger& Logger::instance(){
 }
 
 void Logger::do_log(Level lv, const std::string& msg){
-    if(lv < level_) return;      // 低于当前级别 → 丢弃（set_level 才真正生效）
+    if(lv < level_.load(std::memory_order_relaxed)) return;   // 低于当前级别 → 丢弃（set_level 才真正生效）
+    std::lock_guard<std::mutex> lk(mutex_);   // 整行原子：消息拼接已完成，这里只防两行交错
     std::cout << msg << '\n';
 }
 
 void Logger::set_level(Level lv){
-    this->level_ = lv;
+    level_.store(lv, std::memory_order_relaxed);
 }
 
 }

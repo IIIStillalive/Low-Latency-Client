@@ -11,6 +11,14 @@ RpcFuture RpcFuture::make(EventLoop* bizLoop){
     return f;
 }
 
+RpcFuture RpcFuture::makeFailed(RpcStatus st, std::string error){
+    RpcFuture f;
+    f.state_ = std::make_shared<State>();
+    f.state_->ready  = true;                       // 直接以终态入世：complete()/cancel() 均为 no-op
+    f.state_->result = RpcResult{st, "", std::move(error)};
+    return f;
+}
+
 bool RpcFuture::ready() const{
     if(!state_) return false;
     std::lock_guard<std::mutex> lk(state_->m);

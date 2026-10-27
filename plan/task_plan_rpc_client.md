@@ -204,12 +204,101 @@ public:
 3. `ReliableCodec::sendFrame(type, ...)` 的「当前活动连接」语义：不动 `conn_`，
    断开期间只入 pending_，重连全量重发兜底。
 
-### Day6 — 连接池 + 多路复用 + 背压/取消（P0）
-- [ ] `RpcChannelPool`（N 连接，RoundRobin / LeastInflight）
-- [ ] 每连接 EventLoopThread（multi-reactor；亦可共享单 loop）
-- [ ] `maxInflight` 背压 + `ResourceExhausted`
-- [ ] `Future::cancel()` + `Cancel` 帧
-- [ ] 测试：10k 请求流水线、取消后不再回调、池级统计
+### Day6 — 连接池 + 多路复用 + 背压/取消（P0）——已完成并验证（含 10k 压测）
+- [x] `RpcChannelPool`（N 连接，RoundRobin / LeastInflight）——`include/client/rpc_pool.{hpp,cpp}`
+- [x] 每连接 EventLoopThread（multi-reactor；亦可共享单 loop）——池持有线程，连接只持 `EventLoop*`，
+      每连接独立 poller/TimerQueue，连接间无共享可变状态
+- [x] 池级统计：`stats()` 聚合各连接 `RpcCodec::Stats`、`statsAt(i)` 单连接明细、`inflight()` 全池总数
+- [x] `maxInflight` 背压 + `ResourceExhausted`（池级实测：每连接上限 64，296 次调用 → 256 接受 / 40 拒绝）
+- [x] `Future::cancel()` + `Cancel` 帧（池级实测：8 次 sleep(400ms) 在 50ms 处取消 → 8 个 Cancelled，
+      服务端 400ms 后仍回响应 → 8 个迟到响应被丢弃且不再回调）
+- [x] 池级统计端到端：4 连接 × (100 并发 + 10 轮转) = 440 次调用，440 ok、inflight 归零
+- [x] 测试：10k 请求流水线（`src/rpc_pool_load_test.cpp`，4 连接 × 2500，实测 7 万 QPS 量级）
+- [x] 测试：取消后不再回调（Phase C 断言 `cb == 8` 且 `cancelled == 8`，迟到响应计入 `lateResponses`）
+
+#### Day6 验证证据（2026-10-26）
+```text
+[rpc_pool] PASS: phase1=1 phase2=1 used=4/4 rrExact=1 | stats calls=440 ok=440 timeouts=0 inflight=0
+[rpc_pool] calls per conn: 87 44 32 277
+[rpc_pool] PASS: shutdown -> Unavailable (inflight_before=0)
+[rpc_pool] pool test exit
+```
+- `rrExact=1`：Phase2 切 `RoundRobin` 后每连接恰好 +10 —— 策略切换 + 严格轮转实证。
+- `calls per conn: 87 44 32 277` **不是均衡失败**：`inflight()` 只在 IO 线程执行
+  `startCallInLoop` 后才登记，Phase1 的 400 个调用几乎同时发出，选连接时看到的负载都是 0，
+  平局按轮转打破 —— 这正是 `rpc_pool.hpp` 里写明的「启发式、不保证严格均衡」。
+- Phase1 的 `park seq=N no current conn` 日志是设计行为：400 次调用在 `pool.start()` 之前发出，
+  连接未建立时帧挂在 `ReliableCodec::pending_`，重连成功后全量重发。
+- Phase3 `shutdown() -> Unavailable`：池收尾后 `call()` 立即失败、`inflight` 归零，进程干净退出。
+
+#### Day6 收尾挂死：根因与修复（2026-10-26）
+现象：`rpc_pool_test` 打印完 Phase1/Phase2 的 PASS 后卡住，永不打印 `shutdown -> Unavailable`。
+- 现场：主线程 `wchan=futex_wait_queue_me`（卡在 `RpcChannelPool::shutdown()` 的 `join()`）；
+  4 条池内 IO 线程 + biz loop 全部静在 `do_epoll_wait`（活着但空转）；
+  `/proc/PID/fdinfo/<timerfd>` 显示 5 个 timerfd 全部 `it_value: (0, 0)`。
+- 根因：`TimerQueue::resetTimerfd()` 在 `earliest <= now` 时把 `it_value` 写成 `(0,0)`。
+  timerfd 语义里 **`it_value == 0` 是「解除定时」，不是「立即到期」**；而 `earliestExpiry_`
+  仍保留旧的到期时刻，于是 `addTimer()` 的 `expiry < earliestExpiry_` 判断把之后所有
+  更晚的定时器全部跳过 → 该 loop 的定时器永久失联。
+  本次链路：任务 1 里的 `runAfter(1ms)`（settle）没挂上 → 任务 2 永不执行 → `loop->quit()`
+  永不调用 → `join()` 永不返回。
+- 探针证据：加诊断后单次运行里 `diff <= 0` 兜底分支被触发了 **62 次**（`grep -c 'rawDiff=0'`），
+  说明这条路径不是理论风险而是高频路径。
+- 修复（`include/net/timer_queue.cpp`，2 处）：
+  1. `resetTimerfd()`：`diff <= 0` 兜底成 1µs，保证「有定时器就一定挂上非零值」；
+  2. `addTimer()`：判断条件补上 `earliestExpiry_ <= nowMicros()`，到期时刻已过就强制重设 ——
+     即使 timerfd 已被内核自动解除（单次定时器到期后内核会把 `it_value` 置 0）也能自愈。
+- 顺带修（`include/net/epollpoller.hpp`）：`epoll_ctl` 失败原先静默 `return false`，改为打 ERROR。
+  注册失败 = Channel 永久收不到事件，与本次症状同型但此前完全不可见。
+- 影响面：Day1–Day5 所有 loop 的定时器都走这条路径。回归 `timer_demo` 通过
+  （`tick #1/#2/#3` → `once after 1.6s -> cancel every-timer` → `3.0s up, quit`）。
+- 未完结项：探针版通过可能混杂了 `fprintf` 带来的时序变化（Heisenbug 风险），
+  已排后续稳定性验证（干净版连跑 20 次，任一次 `timeout` 即复现）。
+  **已补验（2026-10-27）：干净版 `rpc_pool_test` 连跑 20 次，20/20 exit=0、每次 2 条 PASS，
+  无一次触发 `timeout`** —— 该修复在无探针开销下同样稳定。
+
+#### Day6 负载测试：10k 流水线 / 背压 / 取消（2026-10-27）
+新二进制 `rpc_pool_load_test`（`src/rpc_pool_load_test.cpp` + CMake 同名 target）。
+三阶段一次跑完，同一服务端连跑 3 次全 PASS：
+
+```text
+run1 exit=0 | A pipeline: ok=10000/10000 elapsed=0.131006s qps=76332.4 pass=1
+             B backpressure: ok=256/256 exhausted=40/40 pass=1
+             C cancel: cb=8/8 cancelled=8 late=8 cbPass=1 latePass=1
+             pool stats: calls=10304 ok=10256 timeouts=0 exhausted=40 cancelled=8 late=8 inflight=0
+run2 exit=0 | A: ok=10000/10000 elapsed=0.143079s qps=69891.5 | B: 256/256 40/40 | C: 8/8 8/8/8
+run3 exit=0 | A: ok=10000/10000 elapsed=0.144538s qps=69186.0 | B: 256/256 40/40 | C: 8/8 8/8/8
+```
+
+设计上怎么保证确定性（改测试时别破坏这三点）：
+- **预热 200ms** 再发 Phase A：`pool.start()` 之后连接未必建立，不预热测到的就是
+  「未连接挂起重发」而不是流水线。
+- **Phase B 用 `sleep(300ms)` 而不是 `echo`**：300ms 内不会有响应释放槽位，
+  296 = 4 × 74，RoundRobin 严格每连接 74 个 → 前 64 接受、后 10 拒绝，完全确定。
+- **Phase C 用 `sleep(400ms)` + 50ms 取消**：取消必然命中 in-flight，服务端的
+  `Cancel` 帧只确认传输不中断执行，400ms 后响应必然迟到 → 可断言「迟到响应被丢弃、不再回调」。
+- 所有 lambda 只按值捕获 `shared_ptr<Ctx>`，不用 `[&]`：`runInLoop/runAfter/then`
+  会把闭包拷进队列，按引用捕获外层闭包成员会在临时闭包析构后悬垂。
+
+QPS 是悲观值：每次调用完成都走 `RpcCodec::finish → TimerQueue::cancel`，而
+`cancel(TimerId)` 目前是 O(n) 线性扫描。10k 在途时这条路径是平方级，Day8 再改成
+`TimerId → set<Timer*>::iterator` 索引。现在的数字只作基线，不作宣传口径。
+
+#### Day6 压测暴露并修掉的两个缺陷（2026-10-27）
+1. **`Logger` 多线程写交错**：`do_log` 之前只做 `std::cout << msg << '\n'`，没有锁。
+   4 条 IO 线程 + biz + main 并发写时，一条消息会被别的线程从中间插进去 ——
+   实测 Phase B 应打 40 条 `inflight full`，日志里按整行 grep 只数到 38。
+   修复：`level_` 改 `std::atomic<Level>`，整行输出加 `std::mutex`（`log.hpp` / `log.cpp`）。
+2. **req_id 跨客户端进程撞号 → 服务端幂等缓存串味**：`RpcCodec` 与 `RpcChannelPool`
+   的 req_id 分配器原先都从 1 开始。服务端按 req_id 缓存响应（断线重发时重放），
+   于是同一服务端上第二次运行客户端时，req_id 1..10304 全部命中上一次实例的缓存：
+   `sleep(300)` 被立刻重放 → in-flight 不累积 → 背压 `exhausted=0/40`；
+   `sleep(400)` 同样秒回 → 取消时已无 in-flight → `cancelled=0`。单跑看不出来，三连跑必现。
+   修复：新增 `RpcCodec::makeReqIdSequence()`，起点取 `random_device` + 时间混合值，
+   进程内每个新分配器再跳 1M 号段（`kReqIdStride`），池与独立连接共用该工厂。
+   修复后同一服务端三连跑全部 PASS。
+   注意：32 位 req_id 只能给概率性保证；要严格唯一需把 `req_id` 升到 64 位（改 proto）。
+
 
 ### Day7 — 断线重连 + 端到端幂等（P0）
 - [ ] 单连接断线：in-flight 保留 + 可靠层重发

@@ -219,7 +219,56 @@ if(Protobuf_FOUND)
     )
     target_include_directories(rpc_client_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(rpc_client_test PRIVATE rpc_proto)
+
+    # Day6 连接池端到端：4 连接 × 每连接多路复用 / 策略切换 / shutdown 收尾时序
+    add_executable(rpc_pool_test
+        src/rpc_pool_test.cpp
+        include/client/rpc_pool.cpp
+        include/client/rpc_connection.cpp
+        include/client/rpc_codec.cpp
+        include/client/rpc_future.cpp
+        include/client/tcp_client.cpp
+        include/client/protocol.cpp
+        include/client/reliable_codec.cpp
+        include/net/length_header_codec.cpp
+        include/net/channel.cpp
+        include/net/buffer.cpp
+        include/net/event_loop.cpp
+        include/net/timer_queue.cpp
+        include/net/socket.cpp
+        include/net/log.cpp
+        include/net/errno.cpp
+        include/server/eventloopthread.cpp
+        include/server/tcp_connnection.cpp
+    )
+    target_include_directories(rpc_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(rpc_pool_test PRIVATE rpc_proto)
+
+    # Day6 负载测试：10k 流水线 / 背压 ResourceExhausted / cancel 后不再回调
+    add_executable(rpc_pool_load_test
+        src/rpc_pool_load_test.cpp
+        include/client/rpc_pool.cpp
+        include/client/rpc_connection.cpp
+        include/client/rpc_codec.cpp
+        include/client/rpc_future.cpp
+        include/client/tcp_client.cpp
+        include/client/protocol.cpp
+        include/client/reliable_codec.cpp
+        include/net/length_header_codec.cpp
+        include/net/channel.cpp
+        include/net/buffer.cpp
+        include/net/event_loop.cpp
+        include/net/timer_queue.cpp
+        include/net/socket.cpp
+        include/net/log.cpp
+        include/net/errno.cpp
+        include/server/eventloopthread.cpp
+        include/server/tcp_connnection.cpp
+    )
+    target_include_directories(rpc_pool_load_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(rpc_pool_load_test PRIVATE rpc_proto)
 else()
-    message(WARNING "protobuf not found -> rpc_server / rpc_client_test 未生成"
+    message(WARNING "protobuf not found -> rpc_server / rpc_client_test / rpc_pool_test /"
+                    " rpc_pool_load_test 未生成"
                     "（sudo apt install -y protobuf-compiler libprotobuf-dev）")
 endif()

@@ -33,6 +33,11 @@ public:
 
     RpcFuture() = default;
 
+    // 构造一个「已完成」的失败句柄，不绑定 codec / biz loop。
+    // 用途：上层在没有可用 RpcCodec 时仍需交出可 then()/wait() 的句柄
+    //       （连接池收尾后收到的 call()、池内无连接等）。
+    static RpcFuture makeFailed(RpcStatus st, std::string error = "");
+
     bool valid() const { return static_cast<bool>(state_); }
     bool ready() const;
 
