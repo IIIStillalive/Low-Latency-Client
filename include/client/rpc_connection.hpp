@@ -20,7 +20,9 @@
 //   3) 最后析构本对象。
 
 #include <atomic>
+#include <functional>   // std::function：连接状态回调
 #include <netinet/in.h>   // struct sockaddr_in
+#include <utility>      // std::move
 
 #include "client/protocol.hpp"
 #include "client/rpc_codec.hpp"
@@ -46,10 +48,16 @@ public:
                    const RpcCallOptions& opts = {});   // 任意线程
 
     void setMaxInflight(size_t n) { rpcCodec_.setMaxInflight(n); }
-    void setReqIdSequence(std::shared_ptr<std::atomic<uint32_t>> seq) {
+    void setReqIdSequence(std::shared_ptr<std::atomic<ReqId>> seq) {
         rpcCodec_.setReqIdSequence(std::move(seq));
     }
     void setAutoReconnect(bool enable, double initialBackoff = 0.5, double maxBackoff = 5.0);
+
+    // 连接状态回调（Day7 D3，供 RpcChannelPool 维护 Slot::available 快照）：
+    //   connected == true  → 刚建立/重连成功，在 relCodec_.onConnected 之后触发
+    //   connected == false → 连接已断开，在 relCodec_.onDisconnected 之后触发
+    // 始终在本连接的 IO 线程调用 —— 调用方只准往原子/无锁状态里写，不准在回调里做阻塞事。
+    void setStateCallback(std::function<void(bool connected)> cb){ stateCb_ = std::move(cb); }
 
     size_t              inflight() const { return rpcCodec_.inflight(); }
     RpcCodec::Stats     stats()    const { return rpcCodec_.stats(); }
@@ -57,6 +65,7 @@ public:
     void stop();                                    // 收尾：loop 停止后于 IO 线程调用一次
 
 private:
+    std::function<void(bool)> stateCb_;   // 空则跳过；回调在 IO 线程触发（见 setStateCallback 注释）
     EventLoop*        ioLoop_;
     LengthHeaderCodec lengthCodec_;   // 仅供 ProtocolCodec 发送时补 4B 长度头
     ProtocolCodec     protoCodec_;

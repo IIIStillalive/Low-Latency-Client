@@ -24,15 +24,20 @@ RpcChannelPool::RpcChannelPool(const struct sockaddr_in& peer, size_t connCount,
     assert(bizLoop_ != nullptr && "池模式必须提供 bizLoop：续体不能跑在各连接的 IO 线程上");
     if(connCount == 0) connCount = 1;
 
-    slots_.reserve(connCount);                         // 之后不再扩容：Slot 地址稳定
+    // deque：只做 placement-new，元素地址终生稳定（含 std::atomic 的 Slot 不可移动，
+    // vector 的 reserve/push_back 都需要移动 → 编译不过；deque 无需 reserve）。
     for(size_t i = 0; i < connCount; ++i){
-        Slot s;
+        slots_.emplace_back();                       // 就地构造：不要求 Slot 可拷贝/可移动
+        Slot& s = slots_.back();
         s.thread = std::make_unique<EventLoopThread>();
         s.loop   = s.thread->startLoop();              // 阻塞到子线程把 EventLoop 建好
         s.conn   = std::make_unique<RpcConnection>(s.loop, peer, bizLoop_);
         s.conn->setReqIdSequence(reqIdSeq_);           // 全池共享：req_id 跨连接唯一
         s.conn->setMaxInflight(maxInflight_);
-        slots_.push_back(std::move(s));
+        // 连接状态落进本元素的 available。地址稳定因此可安全捕获（Day7 D3）。
+        s.conn->setStateCallback([&s](bool connected){
+            s.available.store(connected, std::memory_order_relaxed);
+        });
     }
 }
 
@@ -73,11 +78,23 @@ size_t RpcChannelPool::pickSlot(){
     const size_t n = slots_.size();
     if(n == 0) return kNoSlot;
 
-    // 先取一个轮转起点：RoundRobin 直接用它；LeastInflight 用它做平局打破
+    // 先取一个轮转起点：RoundRobin 用它起扫，LeastInflight 用它做平局打破
     const size_t start = rr_.fetch_add(1, std::memory_order_relaxed) % n;
-    if(policy_.load() == Policy::RoundRobin) return start;
 
-    // LeastInflight：inflight() 是 atomic 快照，只作「避开最忙连接」的启发式。
+    // 不可用（断线中）的连接要被绕过：available 是原子快照，什么时候都不锁。
+    // 全部不可用 → 回退 start / 全量扫描，与 Day6 行为一致（请求挂进 pending_ 等重连）。
+    if(policy_.load() == Policy::RoundRobin){
+        for(size_t k = 0; k < n; ++k){
+            const size_t idx = (start + k) % n;
+            if(slots_[idx].conn == nullptr)                     continue;
+            if(!slots_[idx].available.load(std::memory_order_relaxed)) continue;
+            return idx;
+        }
+        return start;      // 全不可用：回退（帧交给 ReliableCodec 挂起，不 fail）
+    }
+
+    // LeastInflight：只在 available 里挑最小负载；全不可用 → 退回全量扫描。
+    // inflight() 是 atomic 快照，只作「避开最忙连接」的启发式。
     // 注意 startCallInLoop 在 IO 线程才登记 in-flight，刚 call() 完的连接可能仍显示 0，
     // 所以并发下不保证严格均衡 —— 这也是它只作启发式、平局按轮转打破的原因。
     bool   found    = false;
@@ -85,16 +102,31 @@ size_t RpcChannelPool::pickSlot(){
     size_t bestLoad = 0;
     for(size_t k = 0; k < n; ++k){
         const size_t idx = (start + k) % n;
-        if(slots_[idx].conn == nullptr) continue;
-        const size_t load = slots_[idx].conn->inflight();
-        if(!found || load < bestLoad){
-            found    = true;
-            best     = idx;
-            bestLoad = load;
-            if(load == 0) break;                       // 0 已是最小，无需继续扫
+        if(slots_[idx].conn == nullptr)                                  continue;
+        if(slots_[idx].available.load(std::memory_order_relaxed)){
+            const size_t load = slots_[idx].conn->inflight();
+            if(!found || load < bestLoad){
+                found    = true;
+                best     = idx;
+                bestLoad = load;
+                if(load == 0) break;                       // 0 已是最小，无需继续扫
+            }
         }
     }
-    return found ? best : kNoSlot;
+    if(!found){          // 全不可用：退回原来全部连接的扫描（断线窗口仍要派活，pending_ 兜底）
+        for(size_t k = 0; k < n; ++k){
+            const size_t idx = (start + k) % n;
+            if(slots_[idx].conn == nullptr) continue;
+            const size_t load = slots_[idx].conn->inflight();
+            if(best == kNoSlot || load < bestLoad){
+                best     = idx;
+                bestLoad = load;
+                if(load == 0) break;
+            }
+        }
+        return best == kNoSlot ? kNoSlot : best;
+    }
+    return best;
 }
 
 size_t RpcChannelPool::inflight() const{

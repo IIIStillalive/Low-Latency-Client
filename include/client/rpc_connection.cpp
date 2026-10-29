@@ -22,13 +22,26 @@ RpcConnection::RpcConnection(EventLoop* ioLoop, const struct sockaddr_in& peer, 
                                         uint32_t seq, const std::string& body){
         rpcCodec_.onFrame(conn, type, seq, body);      // Response → req_id 关联
     });
+    // RPC 连接状态（Day7 D3/D4）：回调顺序固定，错了会丢帧——
+    //   onConnected 先喂 ReliableCodec（重置 seq + 重发 pending_），再让 RpcCodec 重发 in-flight
+    //   （用**新 seq**，服务端按 req_id 去重），最后通知池更新 available。
+    //   断开时先 relCodec_.onDisconnected()（pending_ 原样保留）再通知池。
     client_.setConnectionCallback([this](TcpConnection* conn){
-        if(conn != nullptr) relCodec_.onConnected(conn);
-        else                relCodec_.onDisconnected();
+        if(conn != nullptr){
+            relCodec_.onConnected(conn);       // ① ReliableCodec：重置 seq 空间 + 重发 pending_
+            rpcCodec_.onReconnected();         // ② RpcCodec：重发 in-flight（仅重连时）
+            if(stateCb_) stateCb_(true);       // ③ 池：Slot::available = true
+        } else {
+            relCodec_.onDisconnected();        // pending_ 原样保留（断线挂起）
+            if(stateCb_) stateCb_(false);      // 池：Slot::available = false
+        }
     });
 
     // RPC 的可靠性参数：Ack 超时 2s / 每 0.5s 扫描 / 最多重发 5 次；
     // 缓存上限 + TTL 防断线期间无界堆积。
+    // TTL 60s 是和服务端 reqs 缓存 TTL 对齐的（src/rpc_server.cpp 的 kReqTtlSec）：客户端
+    // 最多把未确认帧挂 60s，服务端至少留 60s 的响应缓存 —— 重连重发才会命中「重放」而不是
+    // 重复执行。改这里必须同步改那边。
     relCodec_.setRetransmit(2.0, 0.5, 5);
     relCodec_.setCacheLimit(4096, 60.0);
     client_.setAutoReconnect(true, 0.5, 5.0);          // RPC 客户端默认断线自动重连

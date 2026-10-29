@@ -2,7 +2,8 @@
 
 #include <chrono>
 #include <random>
-#include <utility>
+#include <type_traits>   // static_assert：钉住 proto 的 req_id 类型
+#include <utility>       // std::declval
 
 #include "rpc.pb.h"                 // protoc 生成（build/generated，CMake 目标 rpc_proto）
 #include "client/reliable_codec.hpp"
@@ -11,26 +12,36 @@
 
 namespace server {
 
-namespace {
-// 进程内每新建一个分配器就跳过 1M 个号段：同一进程里的连接池 / 独立 RpcCodec 不会撞号。
-constexpr uint32_t kReqIdStride = 1u << 20;
+// 编译期钉住：proto 的 req_id 必须是 64 位。若有人把 rpc.proto 改回 uint32，这里当场
+// 编译失败 —— 而不是运行期把 64 位号静默截成 32 位（截断后撞号 → 命中别人的缓存）。
+static_assert(std::is_same_v<decltype(std::declval<const rpc::RpcRequest&>().req_id()), ReqId>,
+              "rpc.proto 的 RpcRequest.req_id 必须与 server::ReqId(uint64) 一致");
+static_assert(std::is_same_v<decltype(std::declval<const rpc::RpcResponse&>().req_id()), ReqId>,
+              "rpc.proto 的 RpcResponse.req_id 必须与 server::ReqId(uint64) 一致");
 
-uint32_t randomReqIdBase(){
+namespace {
+// 进程内每新建一个分配器就跳过 2^32 个号段：同一进程里的连接池 / 独立 RpcCodec 号段
+// 严格不相交；按 2^32 对齐后，日志里的 req_id 一眼能看出是哪个分配器发的。
+constexpr ReqId kReqIdStride = 1ull << 32;
+
+ReqId randomReqIdBase(){
     // magic static：进程内只做一次随机化；之后每次调用取一个新号段的起点。
-    static std::atomic<uint32_t> cursor{[]{
+    static std::atomic<ReqId> cursor{[]{
         std::random_device rd;
         uint64_t mix = (static_cast<uint64_t>(rd()) << 32) ^ rd();
         // 时间再搅一次：部分平台的 random_device 会退化成固定序列
         mix ^= static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
-        return static_cast<uint32_t>(mix ^ (mix >> 32));
+        mix &= (static_cast<uint64_t>(1) << 63) - 1;          // 清最高位：号段不回绕
+        mix &= ~(static_cast<uint64_t>(kReqIdStride) - 1);    // 对齐到号段边界
+        return static_cast<ReqId>(mix);
     }()};
     return cursor.fetch_add(kReqIdStride, std::memory_order_relaxed);
 }
 } // namespace
 
-std::shared_ptr<std::atomic<uint32_t>> RpcCodec::makeReqIdSequence(){
-    return std::make_shared<std::atomic<uint32_t>>(randomReqIdBase());
+std::shared_ptr<std::atomic<ReqId>> RpcCodec::makeReqIdSequence(){
+    return std::make_shared<std::atomic<ReqId>>(randomReqIdBase());
 }
 
 RpcCodec::RpcCodec(ReliableCodec& rel, EventLoop* ioLoop, EventLoop* bizLoop)
@@ -48,7 +59,7 @@ RpcFuture RpcCodec::call(const std::string& method, const std::string& payload,
     }
 
     // req_id 在调用线程分配（原子）：任意线程 call() 都不需要等 IO 线程。
-    const uint32_t reqId = reqIdSeq_->fetch_add(1, std::memory_order_relaxed);
+    const ReqId reqId = reqIdSeq_->fetch_add(1, std::memory_order_relaxed);
 
     rpc::RpcRequest req;
     req.set_req_id(reqId);
@@ -68,7 +79,7 @@ RpcFuture RpcCodec::call(const std::string& method, const std::string& payload,
     return fut;
 }
 
-void RpcCodec::startCallInLoop(uint32_t reqId, std::string body,
+void RpcCodec::startCallInLoop(ReqId reqId, std::string body,
                                const RpcCallOptions& opts, RpcFuture fut){
     if(stopped_){
         exhausted_.fetch_add(1);
@@ -86,6 +97,7 @@ void RpcCodec::startCallInLoop(uint32_t reqId, std::string body,
     InflightCall& ic = inflight_[reqId];
     ic.future  = fut;
     ic.timerId = 0;
+    ic.requestBody = body;                       // Day7 D4：断线重连时重发 in-flight 用
     if(opts.deadlineSec > 0.0){                          // 超时从 call() 发起时刻起算
         ic.timerId = ioLoop_->runAfter(opts.deadlineSec, [this, reqId]{ onTimeout(reqId); });
     }
@@ -107,7 +119,7 @@ void RpcCodec::onFrame(TcpConnection*, MsgType type, uint32_t, const std::string
         Logger::instance().log(Level::WARN, "[rpc] bad RpcResponse, len=", body.size());
         return;
     }
-    const uint32_t reqId = resp.req_id();
+    const ReqId reqId = resp.req_id();
     if(inflight_.find(reqId) == inflight_.end()){
         // 超时/取消之后迟到的响应，或重复响应：幂等丢弃（不是错误）
         late_.fetch_add(1);
@@ -121,14 +133,31 @@ void RpcCodec::onFrame(TcpConnection*, MsgType type, uint32_t, const std::string
     finish(reqId, std::move(r));
 }
 
-void RpcCodec::onTimeout(uint32_t reqId){
+void RpcCodec::onReconnected(){
+    // 首次连接：in-flight 帧还排在 ReliableCodec 的 pending_，可靠层 onConnected 会全量重发，
+    // 这里不要重复发。everConnected_ 一旦置位，后续每次连接都是「重连」。
+    if(!everConnected_){
+        everConnected_ = true;
+        return;
+    }
+    if(inflight_.empty()) return;
+    // 重连：把全部 in-flight 请求体用**新 seq** 重发（服务端按 req_id 去重，不重复执行；
+    // 尚未被 Ack 的帧会与可靠层 pending_ 重发重叠 —— D4.3 的诚实代价，见头注释）。
+    Logger::instance().log(Level::INFO, "[rpc] reconnect resend inflight=", inflight_.size());
+    for(const auto& kv : inflight_){
+        const InflightCall& ic = kv.second;
+        rel_.sendFrame(MsgType::Request, ic.requestBody.data(), ic.requestBody.size());
+    }
+}
+
+void RpcCodec::onTimeout(ReqId reqId){
     if(inflight_.find(reqId) == inflight_.end()) return;   // 已被响应/取消收口
     timeouts_.fetch_add(1);
     Logger::instance().log(Level::WARN, "[rpc] deadline exceeded req=", reqId);
     finish(reqId, RpcResult{RpcStatus::DeadlineExceeded, "", "deadline exceeded"});
 }
 
-void RpcCodec::cancelInLoop(uint32_t reqId){
+void RpcCodec::cancelInLoop(ReqId reqId){
     if(inflight_.find(reqId) == inflight_.end()) return;   // 已完成/已超时：取消无效
     // best-effort：通知服务端早停（可靠发送，服务端只 Ack 不执行——demo 不做真取消）
     rpc::RpcRequest c;
@@ -140,7 +169,7 @@ void RpcCodec::cancelInLoop(uint32_t reqId){
     finish(reqId, RpcResult{RpcStatus::Cancelled, "", "cancelled by caller"});
 }
 
-void RpcCodec::finish(uint32_t reqId, RpcResult r){
+void RpcCodec::finish(ReqId reqId, RpcResult r){
     auto it = inflight_.find(reqId);
     if(it == inflight_.end()) return;
     if(it->second.timerId != 0 && ioLoop_ != nullptr) ioLoop_->cancel(it->second.timerId);

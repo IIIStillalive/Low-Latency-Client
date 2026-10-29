@@ -9,6 +9,13 @@
 
 namespace server {
 
+// RPC 关联键（端到端身份，不是传输层 seq）。
+// 必须与 proto/rpc.proto 里 RpcRequest/RpcResponse 的 req_id 字段类型一致：
+// rpc_codec.cpp / src/rpc_server.cpp 各有一条 static_assert 在编译期钉住。
+// 为什么是 64 位：服务端按 req_id 缓存响应并在断线重发时重放，只要两个客户端实例
+// 撞号，后一个就会拿到前一个的结果（Day6 用 32 位随机起点只能概率性避免）。
+using ReqId = std::uint64_t;
+
 enum class RpcStatus : uint8_t {
     Ok                = 0,  // 成功
     AppError          = 1,  // 业务错误（服务端 method 返回失败）

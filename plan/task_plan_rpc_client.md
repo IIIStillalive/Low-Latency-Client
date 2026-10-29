@@ -48,8 +48,8 @@ TcpClient       ← 已有：非阻塞握手 + 指数退避重连
 syntax = "proto3";
 package rpc;
 
-message RpcRequest  { uint32 req_id = 1; string method = 2; bytes payload = 3; bool idempotent = 4; }
-message RpcResponse { uint32 req_id = 1; int32 status = 2; bytes payload = 3; string error = 4; }
+message RpcRequest  { uint64 req_id = 1; string method = 2; bytes payload = 3; bool idempotent = 4; }
+message RpcResponse { uint64 req_id = 1; int32 status = 2; bytes payload = 3; string error = 4; }
 ```
 - 帧头保持 5B 不变：`[1B type][4B seq]`。`seq` 是**可靠层**传输序号，`req_id` 是 **RPC 层**关联键，二者职责/生命周期不同。
 - body = protobuf 序列化后的 `RpcRequest` / `RpcResponse`（body 长度由 4B length 头推导，符合 Day4-P0 格式）。
@@ -297,26 +297,35 @@ QPS 是悲观值：每次调用完成都走 `RpcCodec::finish → TimerQueue::ca
    修复：新增 `RpcCodec::makeReqIdSequence()`，起点取 `random_device` + 时间混合值，
    进程内每个新分配器再跳 1M 号段（`kReqIdStride`），池与独立连接共用该工厂。
    修复后同一服务端三连跑全部 PASS。
-   注意：32 位 req_id 只能给概率性保证；要严格唯一需把 `req_id` 升到 64 位（改 proto）。
+   注意：32 位 req_id 只能给概率性保证。**2026-10-27 已升 64 位**（`proto/rpc.proto`
+   `uint64 req_id`，代码统一用别名 `server::ReqId`），号段间隔改为 `1ull << 32`，
+   并在 `rpc_codec.cpp` / `src/rpc_server.cpp` 各加一条 `static_assert` 钉住 proto 类型。
+   proto 改动不向后兼容：新旧二进制必须同时重建。设计见 `plan/day7_design.md` D0。
 
 
 ### Day7 — 断线重连 + 端到端幂等（P0）
-- [ ] 单连接断线：in-flight 保留 + 可靠层重发
-- [ ] 服务端 `reqId → 缓存响应`，重放命中缓存不重复执行
-- [ ] 池内某连接断开时，新请求改道 + 该连接 in-flight 恢复
-- [ ] 测试：断线中 in-flight 恢复、重复 reqId 不重复执行
+- [x] 前置 D0：`req_id` 升 64 位（proto uint64 + `server::ReqId` + `static_assert`，2026-10-27）
+- [x] 前置 D1：`reqs` 缓存 TTL 60s + 容量 65536 双上限，现场验证淘汰路径（2026-10-27）
+- [x] 前置 D2：故障注入三件套——`cut` / `cutreply` 方法 + `--drop-ack K` 标志（2026-10-27）
+- [x] 前置 D3：池内 Slot 可用性快照，断线中**新请求**改道（2026-10-27）
+- [x] 前置 D4：RpcCodec 保留 in-flight 请求体，重连 `onReconnected()` 重发 + 回调顺序（2026-10-27）
+- [x] 服务端 `reqId → 缓存响应`，重放命中缓存不重复执行（T2 实跑验证，2026-10-27）
+- [x] 测试（D5）：`rpc_reconnect_rpc_test`——cut/cutreply/drop-ack 端到端 + 池内改道 + in-flight 恢复（T1–T5 全 PASS，2026-10-27）
 
 ### Day8 — 性能与故障注入（P1）
-- [ ] 写合并 / 批末 flush
-- [ ] `rpc_bench`：N 线程 × M 请求 → QPS + p50/p99/p999
-- [ ] 对比：1 连接 vs 4 连接、单 loop vs multi-reactor
-- [ ] 故障注入：丢 Ack、服务端延迟、随机断连
-- [ ] 压测报告（表格 + 结论）
+- [x] 写合并 / 批末 flush —— `EventLoop::runAtLoopEnd` + `TcpConnection::scheduleBatchFlush`；`inDispatch_` 守卫保证 loop 不跑的测试（栈上 TcpConnection）仍是直写语义（2026-10-28 实现）
+- [x] `rpc_bench`：N 线程 × M 请求 → QPS + p50/p99/p999（`src/rpc_bench.cpp` + CMake 目标，2026-10-28 实现）
+- [x] 对比：1 连接 vs 4 连接、单 loop vs multi-reactor（`rpc_bench --conns 1|4` × `--mode pipeline|sync`；命令已定，数字待 WSL 回填）
+- [x] 故障注入：丢 Ack、服务端延迟、随机断连（`--drop-ack` / `sleep` 方法 / `cut`+`cutreply`，服务端已具备；回归脚本串全部场景）
+- [x] 压测报告（表格 + 结论）—— `plan/bench_report.md`（骨架 + 判定标准 + 命令矩阵已就绪；**数字待回填**）
+
+> 已实现待验证（2026-10-28）：写合并（`include/server/tcp_connnection.cpp`、`include/net/event_loop.{hpp,cpp}`）、
+> 批末 flush 的批外直写守卫、`rpc_bench`、metrics（`rpc_server --stats-sec`）。压测矩阵见 `bench_report.md`。
 
 ### Day9 — 工程化与展示（P2）
-- [ ] README：分层图、线程模型图、协议图、决策与取舍
-- [ ] 指标日志 / metrics 输出
-- [ ] CMake 目标整理；全量回归脚本
+- [x] README：分层图、线程模型图、协议图、决策与取舍（2026-10-28 实现，见 README「异步 RPC 客户端」节）
+- [x] 指标日志 / metrics 输出 —— `rpc_server --stats-sec N`（周期打印 req 速率 + 幂等缓存占用）；`rpc_bench` 打印池级 stats（calls/ok/timeouts/exhausted/late/inflight）
+- [x] CMake 目标整理 —— `netcore`（net+连接层）与 `rpccore`（RPC 客户端传输链）两个静态库，目标从「抄十七个源文件」瘦成「add_executable + link」；全量回归脚本 `scripts/regress.sh --build`（起服务端→跑全部用例→汇总，退出码 0/1 = 全过/有失败）
 
 ---
 

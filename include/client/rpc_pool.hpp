@@ -27,11 +27,13 @@
 //   「断线重发 / 跨连接重放」场景下才能命中。若每连接各自计数，同一 req_id
 //   会在不同连接上重复出现，服务端缓存随即失效。
 //
-// 就绪同步：
-//   本类**不提供**「连接已建立」的查询接口 —— TcpClient::isConnected() 仅允许
-//   loop 线程读，跨线程读是数据竞争。也不需要：连接未就绪时 call() 发出的
-//   Request 会被 ReliableCodec 挂进 pending_，重连成功后全量重发（Day5 已验证）。
-//   同理，断开连接的 inflight 不会下降，LeastInflight 会自然避开它。
+// 就绪同步（Day7 D3 起）：
+//   本类维护每条连接的可用性快照 Slot::available（原子 bool，IO 线程写、池线程读），
+//   pickSlot 会跳过断线中的连接、把新请求改道到可用连接。请求不会因此失败——
+//   断线连接上的 in-flight 帧进 ReliableCodec 的 pending_ 等重连重发，新请求只是不派给它。
+//   这是**启发式快照**，不是同步原语：真实可用性仍由 pending_ 兜底（帧不会丢）。
+//   为什么池不能直接读 TcpClient::isConnected()：它仅允许 loop 线程读，池线程跨线程读
+//   是数据竞争，只能靠 available 这个原子快照。连接未就绪时 call() 照常可用（见上文）。
 //
 // ---------------------------------------------------------------------------
 // 收尾（硬约束，读一遍再改代码）
@@ -67,10 +69,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <netinet/in.h>   // struct sockaddr_in
 #include <string>
-#include <vector>
 
 #include "client/rpc_codec.hpp"        // RpcCodec::Stats（池级聚合的元素类型）
 #include "client/rpc_connection.hpp"
@@ -156,15 +158,19 @@ private:
         std::unique_ptr<EventLoopThread> thread;
         EventLoop*                       loop = nullptr;
         std::unique_ptr<RpcConnection>   conn;
+        // 连接可用性快照（Day7 D3）：由 conn 的状态回调在 IO 线程写、pickSlot 读。
+        // 容器用 std::deque（元素不可移动，见 ctor）：地址稳定 → 构造期绑状态回调
+        // 时捕获 &available 是安全的，无需 reserve/移动。
+        std::atomic<bool>                available{false};
     };
 
     static constexpr size_t kNoSlot = static_cast<size_t>(-1);   // 「无可用槽」
 
     size_t pickSlot();   // 按 policy 选下标；slots_ 为空返回 kNoSlot
 
-    std::vector<Slot>                       slots_;
-    EventLoop*                              bizLoop_;
-    std::shared_ptr<std::atomic<uint32_t>>  reqIdSeq_;   // 全池共享（见文件头）
+    std::deque<Slot>                            slots_;
+    EventLoop*                                  bizLoop_;
+    std::shared_ptr<std::atomic<ReqId>>     reqIdSeq_;   // 全池共享（见文件头）
     std::atomic<size_t>                     rr_{0};      // RoundRobin 游标 / LeastInflight 平局打破
     std::atomic<Policy>                     policy_;
     std::atomic<bool>                       stopped_{false};

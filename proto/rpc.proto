@@ -11,7 +11,7 @@ package rpc;
 
 // 请求：客户端 → 服务端
 message RpcRequest {
-  uint32 req_id     = 1;  // 关联键；断线重发时保持不变（端到端幂等依据）
+  uint64 req_id     = 1;  // 关联键；断线重发时保持不变（端到端幂等依据）
   string method     = 2;  // 方法名（demo：echo / sleep / fail / idem）
   bytes  payload    = 3;  // 业务参数（透传，demo 用 UTF-8 文本）
   bool   idempotent = 4;  // 允许服务端按 req_id 缓存响应并重放
@@ -19,7 +19,7 @@ message RpcRequest {
 
 // 响应：服务端 → 客户端（可能乱序到达）
 message RpcResponse {
-  uint32 req_id  = 1;  // 回填请求的 req_id
+  uint64 req_id  = 1;  // 回填请求的 req_id
   int32  status  = 2;  // 对应 RpcStatus 枚举值（0 = Ok）
   bytes  payload = 3;  // 业务返回值
   string error   = 4;  // 非 Ok 时的错误描述
