@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 #include "timer.hpp"
@@ -27,6 +28,11 @@ private:
     void handleRead();                         // timerfd 可读 → 取出到期批
     void getExpired(std::vector<Timer*>& expired, int64_t now); // 到期<=now 的全部移出
     void resetTimerfd();                       // 把 timerfd 设成 set 最早到期时刻
+
+    // 索引：TimerId → set::iterator，cancel 从 O(n) 线性扫描降到 O(1)（Day8）。
+    // set 是节点容器，erase 其它元素不会使已存 iterator 失效（只被删的那一个失效），
+    // 因此可以安全缓存 iterator；每次 erase/insert 后同步维护本表。
+    std::unordered_map<TimerId, std::set<Timer*, TimerCmp>::iterator> index_;
 
     std::set<Timer*, TimerCmp> timers_;        // 有序，最早在前（TimerQueue 持有所有权）
     EventLoop* loop_;

@@ -48,9 +48,19 @@ void TcpConnection::onRead(){
     }
 }
 
-// send：能直写就先直写，写不完的进 outputBuffer_ 挂可写
+// send：批末写合并（Day8）。仅在「readys 分发中」攒批——IO 线程把本轮所有 send 攒进
+// outputBuffer_，循环末尾统一 writeNow() 一次（每帧一次 write → 每轮一次，多帧流水线收益）。
+// 批外（如 client_protocol_test：loop 从不 runloop，conn 为栈对象）保持旧「能直写就直写」
+// 语义：既不引入 shared_from_this 的 bad_weak_ptr，也保证字节立刻落线。
 void TcpConnection::send(const void* data, size_t n){
-    if(ch_.isremove()) return;
+    if(ch_.isremove() || closed_ || n == 0) return;
+    if(loop_->isInLoopThread() && loop_->inDispatch()){
+        outputBuffer_.append(static_cast<const char*>(data), n);   // 攒批（不直写）
+        scheduleBatchFlush();
+        return;
+    }
+    // 批外 / 跨线程 fallback：保留旧「能直写就直写」语义（outputBuffer_ 非线程安全，
+    // 此分支既服务 loop 不运行的测试，也防御非 loop 线程误用，不在此攒批）。
     const char* raw = static_cast<const char*>(data);
     size_t remaining = n;
     if(!ch_.isWriting() && outputBuffer_.readableBytes() == 0){  // 无积压才直写
@@ -67,6 +77,24 @@ void TcpConnection::send(const void* data, size_t n){
         outputBuffer_.append(raw + (n - remaining), remaining);
         if(!ch_.isWriting()) ch_.enablewriting();  // 积压 → 挂 EPOLLOUT 补发
     }
+}
+
+void TcpConnection::scheduleBatchFlush(){
+    if(batchFlushScheduled_) return;              // 本轮已注册：后续 send 只是再攒一段
+    batchFlushScheduled_ = true;
+    // 保活：flush 回调可能晚于 handleClose 到达，捕获 shared_ptr 让本对象活到 flush 执行完。
+    // （TcpConnection 恒由 shared_ptr 管理：server 的 conns_ / client 的 conn_；
+    //   栈对象只在批外直写路径出现，进不到这里。）
+    std::shared_ptr<TcpConnection> keep = shared_from_this();
+    loop_->runAtLoopEnd([this, keep]() mutable {
+        batchFlushScheduled_ = false;
+        if(closed_ || ch_.isremove()) return;     // 已关闭/已下树：残余输出作废
+        writeNow();                               // 尽力把 outputBuffer_ 一次写空
+        if(closed_ || ch_.isremove()) return;     // writeNow 内部出错路径会 handleClose，别再碰 ch_
+        if(outputBuffer_.readableBytes() > 0 && !ch_.isWriting())
+            ch_.enablewriting();                  // 没写完（内核缓冲满）→ 挂 EPOLLOUT 续补
+        // keep 在 lambda 尾部析构：若期间别处已释放所有权，这里送走最后一份引用
+    });
 }
 
 void TcpConnection::onError(){

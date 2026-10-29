@@ -31,7 +31,8 @@ TimerQueue::~TimerQueue(){
 
 TimerId TimerQueue::addTimer(TimerCallback cb, int64_t expiry, int64_t interval){
     auto* t = new Timer(std::move(cb), expiry, interval, ++nextSequence_);   // 所有权归 TimerQueue
-    timers_.insert(t);
+    auto [it, inserted] = timers_.insert(t);   // Day8：同时维护 O(1) 索引
+    if(inserted) index_.emplace(t->sequence(), it);
     // 只有比 timerfd 当前更早才需重设（earliestExpiry_==0 表示还没设定过）。
     // 再加一条：记录的到期时刻若已过去（到期但尚未被 handleRead 取走，timerfd 此时
     // 可能已被内核自动解除定时），也强制重设一次 —— 否则 earliestExpiry_ 会停在旧值，
@@ -42,15 +43,16 @@ TimerId TimerQueue::addTimer(TimerCallback cb, int64_t expiry, int64_t interval)
 }
 
 void TimerQueue::cancel(TimerId id){
-    // 遍历删除尚未到期的；回调内 cancel 正在执行的重复 timer 属边界，第一版不支持
-    for(auto it = timers_.begin(); it != timers_.end(); ++it){
-        if((*it)->sequence() == id){
-            delete *it;
-            timers_.erase(it);
-            resetTimerfd();   // 若删的是最早，重算 timerfd 到期
-            return;
-        }
-    }
+    // Day8：O(1) 索引定位，不再遍历整个 set。
+    // 回调内 cancel 正在执行的重复 timer 属边界：该 timer 已被 getExpired 移出 timers_
+    // （index_ 同步删除），索引查不到 → 自然 no-op，与第一版语义一致。
+    auto it = index_.find(id);
+    if(it == index_.end()) return;             // 已删除 / 已在到期批中：取消无效
+    Timer* t = *it->second;                    // 所有权归 TimerQueue
+    timers_.erase(it->second);
+    index_.erase(it);
+    delete t;
+    resetTimerfd();   // 若删的是最早，重算 timerfd 到期
 }
 
 void TimerQueue::handleRead(){
@@ -74,7 +76,8 @@ void TimerQueue::handleRead(){
         t->run();                       // 回调在 loop 线程；此处不碰 timers_
         if(t->repeat()){
             t->restart(now);            // 重算下次到期，插回有序集
-            timers_.insert(t);
+            auto [it, inserted] = timers_.insert(t);
+            if(inserted) index_.emplace(t->sequence(), it);   // Day8：索引同步
         } else {
             delete t;                   // 单次：释放
         }
@@ -88,6 +91,7 @@ void TimerQueue::getExpired(std::vector<Timer*>& expired, int64_t now){
         auto it = timers_.begin();
         Timer* t = *it;
         timers_.erase(it);
+        index_.erase(t->sequence());    // Day8：移出有序集也要同步清索引
         expired.push_back(t);
     }
 }

@@ -1,4 +1,7 @@
 
+#include <algorithm>   // std::min
+#include <cstddef>     // std::ptrdiff_t
+
 #include "event_loop.hpp"
 #include "epollpoller.hpp"
 #include "channel.hpp"
@@ -43,10 +46,27 @@ void EventLoop::runloop(){
     while(!quit_){
         readys.clear();          // 清空上一批：否则被摘除/销毁的 Channel* 残留批中，下一批 handleback 会成为 UAF
         poller_->poll(-1, readys);
+        inDispatch_ = true;      // Day8 写合并：批内以「本轮末尾统一 flush」替代逐帧 write
         for(auto& it : readys){
             it->handleback();  //为就绪fd调用回调
         }
+        inDispatch_ = false;
         //dopendingFunctors();  //额外执行一次,多余
+        // Day8 批末写合并：readys 全部处理完、回到 epoll_wait 前，执行本批攒下的统一 flush。
+        // TcpConnection::send 借此把一轮内的多次 send 合并成一次写（减少 syscall）。
+        if(!loopEndFunctors_.empty()){
+            std::vector<Callback> batch;
+            batch.swap(loopEndFunctors_);
+            for(auto& cb : batch) cb();
+        }
+    }
+}
+
+void EventLoop::runAtLoopEnd(Callback cb){
+    if(isInLoopThread()){
+        loopEndFunctors_.emplace_back(std::move(cb));
+    } else {
+        runInLoop([this, cb = std::move(cb)]() mutable { loopEndFunctors_.emplace_back(std::move(cb)); });
     }
 }
 int EventLoop::createEventfd(){
@@ -100,14 +120,30 @@ bool EventLoop::handlewake(){
     return true;
 }
 
+// 有界批 + 自我唤醒（Day8-b 修复）：eventfd 会把多线程聚合的 runInLoop 洪峰一次性交过来，
+// 若这里全量 swap 跑完，本 loop 在单次 dispatch 内长时间只跑 functor、不读 socket ——
+// 高在途多调用线程的流水线会秒级停摆（实测 p50≈wall、late>0=2s 超时重传）。改为每轮至多
+// 取 kBatch 个；跑完若队列仍有积压，再写一次 eventfd 自我唤醒，回到 epoll_wait 与 socket
+// I/O 交替服务。语义不变（任务最终全部执行），只约束"单次执行多少"。
 void EventLoop::dopendingFunctors(){
+    constexpr size_t kBatch = 1024;
     std::vector<Callback> functors;
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        functors.swap(pendingFunctors_); // 用 swap 减少持锁时间
+        const size_t take = std::min(pendingFunctors_.size(), kBatch);
+        if(take == 0) return;                              // 空队列：无活
+        functors.assign(pendingFunctors_.begin(),
+                        pendingFunctors_.begin() + static_cast<std::ptrdiff_t>(take));
+        pendingFunctors_.erase(pendingFunctors_.begin(),
+                               pendingFunctors_.begin() + static_cast<std::ptrdiff_t>(take));
     }
     for(auto& cb : functors){
-        cb();  //进行任务队列的处理 
+        cb();  //进行任务队列的处理
+    }
+    {
+        // 本批没拿完 / 执行期间又有新任务 → 自我唤醒，下一轮 epoll_wait 继续（与 socket I/O 交替）
+        std::unique_lock<std::mutex> lock(mutex_);
+        if(!pendingFunctors_.empty()) wakeup();
     }
 }
 }

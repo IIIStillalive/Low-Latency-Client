@@ -28,7 +28,7 @@ public:
 
     // 预留回调接口：连接关闭时通知所有者(main)把我释放；所有权属于外部
     void setCloseCallback(std::function<void(TcpConnection*)> cb);
-    void send(const void* data, size_t n);   // public：业务侧发送入口
+    void send(const void* data, size_t n);   // public：业务侧发送入口（IO 线程批末写合并）
     void close();                        // 主动断开：走 handleClose 完整关闭链（下树+cancel心跳+通知owner）
     using MessageCallback = std::function<void(TcpConnection*, Buffer*)>;
     void setMessageCallback(MessageCallback cb);   // 业务层挂钩：onRead 读到的字节交给它解析
@@ -56,6 +56,9 @@ private:
     int64_t timeoutUs_ = 0;        // 空闲超时阈值（微秒）；仅 ioLoop 线程读
     int64_t lastActive_ = 0;       // 最后活跃时刻（CLOCK_MONOTONIC 微秒）；仅 ioLoop 线程读写
     TimerId timeoutTimerId_ = 0;   // 心跳定时器 id，handleClose 时取消防悬垂
+
+    bool batchFlushScheduled_ = false;   // 本轮批末 flush 已登记（防重复注册/悬垂自续）
+    void scheduleBatchFlush();           // [IO 线程] send 攒批后注册本轮末尾 flush
 
 };
 
