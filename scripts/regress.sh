@@ -42,19 +42,44 @@ run_test() {
     fi
 }
 
+# port_busy <port> —— TCP connect 探测该端口是否已有进程在监听
+port_busy() {
+    if (exec 3<>/dev/tcp/127.0.0.1/$1) 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 # start_srv <名称> <监听端口> <pidfile> <日志> <命令...>
 #   后台拉起服务端，用 TCP connect 探测端口就绪（最多 3s）。
+#   守卫（2026-10-29 残留进程教训）：启动前预检端口必须空闲——若被残留/孤儿服务端占着，
+#   connect 探测会命中旧进程，新服务端 bind 失败静默退出，测试就"静默连错服务端"、结论全废。
+#   预检不过 / 进程启动失败 / 超时未监听，一律显式报错 exit 1（trap 收尸已启服务端），不静默继续。
 start_srv() {
     local name=$1 port=$2 pidf=$3 logf=$4; shift 4
+    if port_busy "$port"; then
+        echo "ERROR: 端口 $port 已被占用（[$name] 无法启动）—— 疑似残留/孤儿服务端。详情："
+        ss -ltnp "sport = :$port" 2>/dev/null | tail -n +2 | sed 's/^/    /'
+        echo "    清理后重跑，例如：pkill -f '$(basename "$1")'（或按上面 pid 逐个 kill）"
+        exit 1
+    fi
     "$@" >"$logf" 2>&1 &
     echo $! > "$pidf"
+    local okay=0
     for _ in $(seq 1 30); do
-        if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
-            exec 3>&- 2>/dev/null; exec 3<&- 2>/dev/null
-            break
+        if port_busy "$port"; then okay=1; break; fi
+        if ! kill -0 "$(cat "$pidf")" 2>/dev/null; then
+            echo "ERROR: server [$name] 启动失败（进程已退出）—— 日志尾部："
+            tail -n 20 "$logf" | sed 's/^/      | /'
+            exit 1
         fi
         sleep 0.1
     done
+    if [ "$okay" -ne 1 ]; then
+        echo "ERROR: server [$name] 超过 3s 未监听 $port —— 日志尾部："
+        tail -n 20 "$logf" | sed 's/^/      | /'
+        exit 1
+    fi
     sleep 0.3
     echo "    server [$name] port=$port pid=$(cat "$pidf")"
 }
