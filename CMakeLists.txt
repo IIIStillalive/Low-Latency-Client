@@ -94,6 +94,31 @@ add_executable(client_delivery_test
 target_link_libraries(client_delivery_test PRIVATE netcore)
 
 # ============================================================================
+# Day10 聊天室业务（真实业务，闭合 README 唯一未勾项）
+#
+#   播放层 chatcore：帧编解码 + ChatServer（房间 registry + 跨 loop 广播）。
+#   不依赖 protobuf → 放 Protobuf 块外，无 protobuf 也照常生成。
+#   广播路径只走 TcpServer::setMessageCallback / sendMessage 两个公开口，核心零改动。
+# ============================================================================
+add_library(chatcore STATIC
+    include/chat/message_proto.cpp
+    include/chat/chat_server.cpp
+)
+target_include_directories(chatcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(chatcore PUBLIC netcore)
+
+add_executable(chat_server
+    src/chat_server.cpp
+    include/server/acceptor.cpp
+    include/server/tcpserver.cpp
+    include/server/thread_pool.cpp
+)
+target_link_libraries(chat_server PRIVATE chatcore)
+
+add_executable(chat_room_test src/chat_room_test.cpp)
+target_link_libraries(chat_room_test PRIVATE chatcore)
+
+# ============================================================================
 # Day5：异步 RPC 客户端（protobuf 序列化 + req_id 关联 + Future）
 #
 #   proto/rpc.proto ──protoc──▶ build/generated/rpc.pb.{cc,h}（生成物不进仓库）

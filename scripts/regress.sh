@@ -13,6 +13,7 @@
 # 服务端需求（脚本按需启动并自动收尸）：
 #   server_ack —— 绑定 127.0.0.1:8888（hardcode）
 #   rpc_server —— 8899（普通）+ 8898（--drop-ack 1，专供 T5）
+#   chat_server —— 8890，--threads 2（多 worker：聊天广播跨 loop 扇出路径的端到端验证）
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1      # 仓库根
@@ -72,6 +73,7 @@ cleanup() {
     stop_srv "$TMP/srv_ack_cut.pid"
     stop_srv "$TMP/srv_rpc.pid"
     stop_srv "$TMP/srv_rpc_t5.pid"
+    stop_srv "$TMP/srv_chat.pid"
 }
 trap cleanup EXIT
 
@@ -89,7 +91,8 @@ fi
 NEEDED="$BIN/client_protocol_test $BIN/server_ack $BIN/client_reliability_test \
         $BIN/client_delivery_test $BIN/client_reconnect_test \
         $BIN/rpc_server $BIN/rpc_client_test $BIN/rpc_pool_test \
-        $BIN/rpc_pool_load_test $BIN/rpc_reconnect_rpc_test $BIN/rpc_bench"
+        $BIN/rpc_pool_load_test $BIN/rpc_reconnect_rpc_test $BIN/rpc_bench \
+        $BIN/chat_server $BIN/chat_room_test"
 for b in $NEEDED; do
     if [ ! -x "$b" ]; then
         echo "ERROR: 缺少 $b —— 先跑 cmake -S . -B build && cmake --build build（RPC 目标需 protobuf）"
@@ -134,6 +137,13 @@ start_srv rpc_server_t5 8898 "$TMP/srv_rpc_t5.pid" "$TMP/srv_rpc_t5.log" \
          "$BIN/rpc_server" --port 8898 --drop-ack 1
 run_test rpc_reconnect_t5        180 "$BIN/rpc_reconnect_rpc_test" --port 8898 --case T5
 stop_srv "$TMP/srv_rpc_t5.pid"
+
+echo
+echo "=== (6) Day10 聊天室真实业务（chat_server @8890，--threads 2 跨 loop 广播）==="
+start_srv chat_server 8890 "$TMP/srv_chat.pid" "$TMP/srv_chat.log" \
+         "$BIN/chat_server" --port 8890 --threads 2
+run_test chat_room_test 120 "$BIN/chat_room_test" --port 8890
+stop_srv "$TMP/srv_chat.pid"
 
 echo
 echo "=== 汇总 ==="
