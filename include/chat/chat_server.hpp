@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -7,6 +8,7 @@
 #include <vector>
 
 namespace server { class TcpConnection; class TcpServer; }
+namespace kv   { class KvStore; }
 
 // 聊天室业务层（Day10）：挂在 TcpServer::setMessageCallback / sendMessage 之上，不改任何核心。
 //   帧协议：include/chat/message_proto.hpp（1B type，无 protobuf）。
@@ -29,11 +31,20 @@ public:
     explicit ChatServer(server::TcpServer* srv);
     void onMessage(server::TcpConnection* conn, const std::string& payload);  // 消息回调入口
 
+    // kv-engine 回接（见 plan/task_plan_kv_im.md）：nullptr=历史关闭（Day10 原样）。
+    void setHistory(kv::KvStore* kv);
+    // 优雅停机：必须在 runloop 返回后调用 → kv.flush()+close()，保证 SIGTERM 时历史落盘（G7）。
+    void stop();
+
 private:
     void handleJoin(server::TcpConnection* conn, const std::string& room, const std::string& name);
     void handleMsg(server::TcpConnection* conn, const std::string& room, const std::string& msg);
     void handleLeave(server::TcpConnection* conn, const std::string& room);
     void handleList(server::TcpConnection* conn, const std::string& room);
+    void handleHistory(server::TcpConnection* conn, const std::string& room,
+                       uint32_t count, uint32_t before);
+    // 重建 next_seq_：全扫房间推导 max，lock 内 seedSeq 只升不降（防两 loop 竞态重复 seq）。
+    void seedRoomSeq(const std::shared_ptr<ChatRoom>& room, const std::string& roomName);
 
     std::shared_ptr<ChatRoom> findRoom(const std::string& room);      // 只读 registry；不存在=nullptr
     std::shared_ptr<ChatRoom> getOrCreate(const std::string& room);   // 缺则建（空房保留，诚实边界）
@@ -44,6 +55,7 @@ private:
     void broadcast(const std::shared_ptr<ChatRoom>& room, const std::string& frame); // 扇出（含发送者 echo）
 
     server::TcpServer* srv_;           // 只持有指针；生命周期随 TcpServer（同栈/同进程）
+    kv::KvStore* kv_ = nullptr;        // 历史落库目标；nullptr=历史关闭。生命周期随 ChatServer
     mutable std::mutex roomsMtx_;
     std::map<std::string, std::shared_ptr<ChatRoom>> rooms_;   // 房间号 → 房间（registry）
 };
@@ -62,9 +74,18 @@ public:
     // 成员昵称列表（MEMBERS 帧用）。
     std::vector<std::string> names();
 
+    // ---- 历史 seq（kv-engine 回接，见 plan/task_plan_kv_im.md §3）----
+    // 锁内取下一 seq 并自增：并发成员写到互不相同的键，无丢无重。
+    uint64_t takeSeq();
+    bool seqSeeded() const;             // 已推导过 next_seq_？
+    uint64_t highestSeq() const;        // seeded 后当前最大 seq（next_seq_-1）；未 seed 时 0
+    void seedSeq(uint64_t low);         // 只升不降：next_seq_ = max(next_seq_, low)，防两 leader 竞态
+
 private:
     mutable std::mutex mtx_;
     std::vector<std::pair<std::weak_ptr<server::TcpConnection>, std::string>> members_;
+    uint64_t next_seq_ = 0;             // 下一条消息的 seq（重启后由 seed 回推）
+    bool seeded_ = false;               // 内存内是否已从此房间推导过 next_seq_
 };
 
 } // namespace chat

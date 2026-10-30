@@ -96,16 +96,39 @@ target_link_libraries(client_delivery_test PRIVATE netcore)
 # ============================================================================
 # Day10 聊天室业务（真实业务，闭合 README 唯一未勾项）
 #
-#   播放层 chatcore：帧编解码 + ChatServer（房间 registry + 跨 loop 广播）。
+#   播放层 chatcore：帧编解码 + ChatServer（房间 registry + 跨 loop 广播 + kv 历史）。
 #   不依赖 protobuf → 放 Protobuf 块外，无 protobuf 也照常生成。
 #   广播路径只走 TcpServer::setMessageCallback / sendMessage 两个公开口，核心零改动。
+#
+# kv-engine 回接（plan/task_plan_kv_im.md §5，选项 A：链接兄弟仓库，单一事实源）：
+#   kv-engine 是纯头跳表 + wal/kv_store 两个 .cpp；直接按源加入，不 add_subdirectory
+#   （子目录会把它 6 个测试可执行 + enable_testing + TSAN 选项带进本构建）。
 # ============================================================================
+set(KV_ENGINE_SRC_DIR "")
+foreach(_kv_cand
+        "${CMAKE_CURRENT_SOURCE_DIR}/../kv-engine"
+        "/mnt/f/C++项目/kv-engine"
+        "F:/C++项目/kv-engine")
+    if(EXISTS "${_kv_cand}/CMakeLists.txt")
+        set(KV_ENGINE_SRC_DIR "${_kv_cand}")
+        break()
+    endif()
+endforeach()
+if(NOT KV_ENGINE_SRC_DIR)
+    message(FATAL_ERROR "kv-engine 缺失（已找 ../kv-engine、/mnt/f/C++项目/kv-engine、F:/C++项目/kv-engine）——选项 A 依赖它")
+endif()
+add_library(kvcore STATIC
+    ${KV_ENGINE_SRC_DIR}/src/wal.cpp
+    ${KV_ENGINE_SRC_DIR}/src/kv_store.cpp
+)
+target_include_directories(kvcore PUBLIC ${KV_ENGINE_SRC_DIR}/include)
+
 add_library(chatcore STATIC
     include/chat/message_proto.cpp
     include/chat/chat_server.cpp
 )
 target_include_directories(chatcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(chatcore PUBLIC netcore)
+target_link_libraries(chatcore PUBLIC netcore kvcore)
 
 add_executable(chat_server
     src/chat_server.cpp
@@ -117,6 +140,41 @@ target_link_libraries(chat_server PRIVATE chatcore)
 
 add_executable(chat_room_test src/chat_room_test.cpp)
 target_link_libraries(chat_room_test PRIVATE chatcore)
+
+# ============================================================================
+# v2 用户层多会话 IM（类飞书；见 include/im/im_server.hpp）
+#
+#   imcore：业务层静态库（im_server.cpp，转发 imEncode/imDecode + kv 持久化）。
+#   消息协议仍在 chatcore 的 message_proto.cpp（零重复），imcore 直接链 chatcore。
+#   im_server 入口 + im_test 回归 harness（F1–F10），端口 8891（不与 chat_server 抢）。
+# ============================================================================
+add_library(imcore STATIC
+    include/im/im_server.cpp
+)
+target_include_directories(imcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(imcore PUBLIC chatcore)
+
+add_executable(im_server
+    src/im_server.cpp
+    include/server/acceptor.cpp
+    include/server/tcpserver.cpp
+    include/server/thread_pool.cpp
+)
+target_link_libraries(im_server PRIVATE imcore)
+
+add_executable(im_test src/im_test.cpp)
+target_link_libraries(im_test PRIVATE chatcore)
+
+# ============================================================================
+# Qt6 聊天客户端（qt/，独立子构建）：默认 OFF —— 无 Qt6 环境不破坏既有构建。
+#   开启需本机装有 Qt6>=6.2：
+#     cmake -B build-qt -DCMAKE_PREFIX_PATH=C:/Qt/6.x.y/msvc2019_64 -DBUILD_QT_CLIENT=ON
+#   或独立构建：cmake -S qt -B build-qt -DCMAKE_PREFIX_PATH=...（不侵入顶层）。
+# ============================================================================
+option(BUILD_QT_CLIENT "Build Qt6 chat client (qt/, needs Qt6 Widgets+Network)" OFF)
+if(BUILD_QT_CLIENT)
+    add_subdirectory(qt)
+endif()
 
 # ============================================================================
 # Day5：异步 RPC 客户端（protobuf 序列化 + req_id 关联 + Future）

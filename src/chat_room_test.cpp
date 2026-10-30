@@ -1,19 +1,23 @@
-// Day10 聊天室端到端：G1–G5 收敛断言（配合 chat_server 运行）。
+// Day10 聊天室端到端：G1–G6b 收敛断言（配合 chat_server 运行）。
 //
-//   ./build/chat_server --port 8890 --threads 2 &      # regress.sh 用 2 worker（跨 loop 广播）
-//   ./build/chat_room_test --port 8890                 # exit 0 = 全过
+//   ./build/chat_server --port 8890 --threads 2 --kv-path /tmp/chat.wal &   # regress 用 2 worker
+//   ./build/chat_room_test --port 8890          # exit 0 = 全过（G6/G6b 需服务端开历史；不带 --kv-path 用 --nohistory）
 //
 // 测试客户端用裸阻塞 socket + 每客户端一个读者线程（纯测试 harness，不走事件循环）：
 //   帧 = [4B 大端长度][payload]，payload = 聊天帧（1B type，见 message_proto.hpp）。
-// 判定矩阵（task_plan_chat_room.md §5）：
+// 判定矩阵（task_plan_chat_room.md §5 + task_plan_kv_im.md §6）：
 //   G1 基本广播：2 客户同房，A 发 3 条 → 双方各收 3 条 S2C_MSG，内容/顺序一致（含发送者 echo）
 //   G2 跨 loop 无丢无重不乱序：6 客户 × 各发 200 条 → 每客户收 N×K，且每发送者 seq 单调递增
 //   G3 断线清理：成员无 LEAVE 直接 close → 广播不崩溃、不投给死连接；其余成员计数正确
 //   G4 非法帧：未知 type / 超大帧 → 服务端不回崩溃，后续正常 join 可用
 //   G5 LEAVE + 同名重建：leave 后退房，重新 join 同房同昵称 → 无残留成员、无重复投递
+//   G6 同服务端事件历史：A 发 h1..h3 → 新连接 C join → C2S_HISTORY → 恰 3 条 (seq0..2, a,h1..3) 升序
+//   G6b 翻页：发 m1..m5（seq0..4）→ C2S_HISTORY(2, before=4) 恰得 (seq2,a,m3)(seq3,a,m4)；before=0 得全部 5 条升序
+//   单发模式：--seed N 写 N 条 / --verify N 校验恰 N 条同序（G7 重启持久化）；--nohistory 验关闭路径
 #include <arpa/inet.h>
 #include <atomic>
 #include <chrono>
+#include <cstddef>   // std::ptrdiff_t（historySlice 迭代器步进）
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -120,6 +124,9 @@ public:
     bool sendJoin(){ return sendPayload(chat::encodeJoin(room_, name_)); }
     bool sendLeave(){ return sendPayload(chat::encodeLeave(room_)); }
     bool sendList(){ return sendPayload(chat::encodeList(room_)); }
+    bool sendHistory(uint32_t count = 200, uint32_t before = 0){
+        return sendPayload(chat::encodeHistory(room_, count, before));
+    }
 
     bool join(int timeoutMs = 3000){                 // 同步等 S2C_JOINED
         if(!sendJoin()) return false;
@@ -130,6 +137,19 @@ public:
     bool waitMembers(int timeoutMs = 3000){
         const int e0 = membersEpoch_.load();
         return waitFor([&]{ return membersEpoch_.load() > e0; }, timeoutMs) != 0;
+    }
+    // ---- 历史断言入口 ----
+    int historyEpoch() const { return historyEpoch_.load(); }
+    bool waitHistoryFrom(int epoch, int timeoutMs = 5000){   // 等到新一批 S2C_HISTORY 到达
+        return waitFor([&]{ return historyEpoch_.load() > epoch; }, timeoutMs) != 0;
+    }
+    size_t historySize(){ std::lock_guard<std::mutex> lk(m_); return historyMsgs_.size(); }
+    // 第 from 条起的切片：reader 追加序 = 服务端升序（最旧→最新）
+    std::vector<chat::HistoryEntry> historySlice(size_t from){
+        std::lock_guard<std::mutex> lk(m_);
+        if(from >= historyMsgs_.size()) return {};
+        auto begin = historyMsgs_.begin() + static_cast<std::ptrdiff_t>(from);
+        return std::vector<chat::HistoryEntry>(begin, historyMsgs_.end());
     }
     long long msgCount() const { return msgCount_.load(); }
     long long errCount() const { return errCount_.load(); }
@@ -175,6 +195,12 @@ private:
             }
             case chat::S2C_ERROR: errCount_++; break;
             case chat::S2C_MEMBERS: membersEpoch_.fetch_add(1); break;
+            case chat::S2C_HISTORY:{
+                std::lock_guard<std::mutex> lk(m_);
+                for(const auto& e : d.history) historyMsgs_.push_back(e);
+                historyEpoch_.fetch_add(1);
+                break;
+            }
             default: break;                            // LEFT/未知：本测试不断言
             }
         }
@@ -185,10 +211,12 @@ private:
     std::atomic<bool> closed_{false}, joined_{false};
     std::atomic<long long> msgCount_{0}, errCount_{0};
     std::atomic<int> membersEpoch_{0};              // S2C_MEMBERS 到达次数（LIST 栅栏用）
+    std::atomic<int> historyEpoch_{0};              // S2C_HISTORY 到达批数
     std::thread rd_;
     std::mutex m_;
     std::vector<std::pair<std::string,int>> recv_;     // (from, seq) 按接收序
     std::vector<std::string> msgs_;
+    std::vector<chat::HistoryEntry> historyMsgs_;   // (from,msg)+seq 服务端升序（最旧→最新）
 };
 
 // ---------------------------------------------------------------------------
@@ -362,17 +390,160 @@ static bool g5(int port, int& pass, int& fail){
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// G6 / G6b：历史（kv 必须开启，即服务端带 --kv-path 启动）
+//   G6：同服务端事件历史 —— 广播完成 ⇒ 已落库（put 在广播前），新连接拉历史恰得全部、升序。
+// ---------------------------------------------------------------------------
+static bool g6(int port, int& pass, int& fail){
+    const bool ok = [&]{
+        ChatClient a("g6h", "a");
+        if(!a.connect(port)) return false;
+        a.listen();
+        if(!a.join()) return false;
+        a.sendMsg("h1"); a.sendMsg("h2"); a.sendMsg("h3");
+        if(!waitFor([&]{ return a.msgCount() == 3; }, 5000)){   // 广播 echo ⇒ 3 条全落库
+            std::cout << "  sender echo timeout\n"; return false;
+        }
+
+        ChatClient c("g6h", "c");                       // 新房客：拉历史
+        if(!c.connect(port)) return false;
+        c.listen();
+        if(!c.join()) return false;
+        const size_t base = c.historySize();
+        const int e0 = c.historyEpoch();
+        c.sendHistory(200, 0);
+        if(!c.waitHistoryFrom(e0)){ std::cout << "  history timeout\n"; return false; }
+        const std::vector<chat::HistoryEntry> got = c.historySlice(base);
+        const std::vector<chat::HistoryEntry> want = {
+            {0,"a","h1"}, {1,"a","h2"}, {2,"a","h3"}};      // seq 0..2 + (from,msg) 升序
+        const bool matched = got == want;
+        std::cout << "  history=" << got.size() << " want=3 matched=" << matched << "\n";
+        return matched;
+    }();
+    std::cout << "[G6] history same-server: " << (ok ? "PASS" : "FAIL") << "\n";
+    ok ? ++pass : ++fail;
+    return ok;
+}
+
+static bool g6b(int port, int& pass, int& fail){
+    const bool ok = [&]{
+        ChatClient a("g6p", "a");
+        if(!a.connect(port)) return false;
+        a.listen();
+        if(!a.join()) return false;
+        for(int i = 1; i <= 5; ++i) a.sendMsg("m" + std::to_string(i));   // seq 0..4
+        if(!waitFor([&]{ return a.msgCount() == 5; }, 5000)){
+            std::cout << "  sender echo timeout\n"; return false;
+        }
+
+        ChatClient c("g6p", "c");
+        if(!c.connect(port)) return false;
+        c.listen();
+        if(!c.join()) return false;
+
+        // ① 上翻：count=2, before_seq=4 → 严格早于 4 → seq 2,3 → (a,m3)(a,m4)
+        const size_t b1 = c.historySize();
+        const int e1 = c.historyEpoch();
+        c.sendHistory(2, 4);
+        if(!c.waitHistoryFrom(e1)){ std::cout << "  page1 timeout\n"; return false; }
+        const std::vector<chat::HistoryEntry> p1 = c.historySlice(b1);
+        const bool ok1 = p1 == std::vector<chat::HistoryEntry>{{2,"a","m3"}, {3,"a","m4"}};
+
+        // ② 取最新全部：count=200, before=0 → 5 条 m1..m5 升序
+        const size_t b2 = c.historySize();
+        const int e2 = c.historyEpoch();
+        c.sendHistory(200, 0);
+        if(!c.waitHistoryFrom(e2)){ std::cout << "  page2 timeout\n"; return false; }
+        const std::vector<chat::HistoryEntry> p2 = c.historySlice(b2);
+        const bool ok2 = p2 == std::vector<chat::HistoryEntry>{
+            {0,"a","m1"}, {1,"a","m2"}, {2,"a","m3"}, {3,"a","m4"}, {4,"a","m5"}};
+        std::cout << "  page1(before=4)=ok:" << ok1 << " (" << p1.size()
+                  << ") all(200,0)=ok:" << ok2 << " (" << p2.size() << ")\n";
+        return ok1 && ok2;
+    }();
+    std::cout << "[G6b] history paging: " << (ok ? "PASS" : "FAIL") << "\n";
+    ok ? ++pass : ++fail;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// 单发模式（G7 重启持久化用，regress 段 (6b)）：
+//   --seed N   : join 房 g7 发 N 条 distinct 消息 → 等回声 → exit 0
+//   --verify N : join 房 g7，C2S_HISTORY(200,0) → 断言恰 N 条 (a,kvs1..N) 同序 → exit 0
+//   --nohistory: G1–G5 不回归 + C2S_HISTORY 在历史关闭路径回 S2C_ERROR
+// ---------------------------------------------------------------------------
+static bool seedMode(int port, int n){
+    ChatClient a("g7", "a");
+    if(!a.connect(port)){ std::cout << "  connect fail\n"; return false; }
+    a.listen();
+    if(!a.join()) return false;
+    for(int i = 1; i <= n; ++i) a.sendMsg("kvs" + std::to_string(i));
+    const bool ok = waitFor([&]{ return a.msgCount() == n; }, 15000);
+    std::cout << "[seed] n=" << n << " echo=" << a.msgCount() << "\n";
+    return ok;
+}
+static bool verifyMode(int port, int n){
+    ChatClient b("g7", "b");
+    if(!b.connect(port)){ std::cout << "  connect fail\n"; return false; }
+    b.listen();
+    if(!b.join()) return false;
+    const size_t base = b.historySize();
+    const int e0 = b.historyEpoch();
+    b.sendHistory(200, 0);
+    if(!b.waitHistoryFrom(e0)){ std::cout << "  history timeout\n"; return false; }
+    const std::vector<chat::HistoryEntry> got = b.historySlice(base);
+    bool matched = static_cast<int>(got.size()) == n;
+    for(int i = 0; matched && i < n; ++i){
+        matched = got[static_cast<size_t>(i)] == chat::HistoryEntry{static_cast<uint64_t>(i), "a",
+                                                                    "kvs" + std::to_string(i + 1)};
+    }
+    std::cout << "[verify] want=" << n << " got=" << got.size() << " matched=" << matched << "\n";
+    return matched;
+}
+static bool noHistoryCheck(int port, int& pass, int& fail){
+    const bool ok = [&]{
+        ChatClient c("nh", "c");
+        if(!c.connect(port)) return false;
+        c.listen();
+        if(!c.join()) return false;
+        c.sendHistory(200, 0);
+        const bool err = waitFor([&]{ return c.errCount() > 0; }, 5000);
+        const bool noData = c.historySize() == 0;
+        std::cout << "  historyUnavailableErr=" << err << " noHistoryData=" << noData << "\n";
+        return err && noData;
+    }();
+    std::cout << "[nohistory] C2S_HISTORY -> S2C_ERROR: " << (ok ? "PASS" : "FAIL") << "\n";
+    ok ? ++pass : ++fail;
+    return ok;
+}
+
 int main(int argc, char** argv){
     int port = 8890;
+    int seedN = 0, verifyN = 0;
+    bool noHistory = false;
     for(int i = 1; i + 1 < argc; ++i){
-        if(std::string(argv[i]) == "--port") port = std::atoi(argv[i+1]);
+        if(std::string(argv[i]) == "--port")   port    = std::atoi(argv[i+1]);
+        if(std::string(argv[i]) == "--seed")   seedN   = std::atoi(argv[i+1]);
+        if(std::string(argv[i]) == "--verify") verifyN = std::atoi(argv[i+1]);
     }
+    for(int i = 1; i < argc; ++i){
+        if(std::string(argv[i]) == "--nohistory") noHistory = true;
+    }
+    if(seedN > 0)    return seedMode(port, seedN)   ? 0 : 1;
+    if(verifyN > 0)  return verifyMode(port, verifyN) ? 0 : 1;
+
     int pass = 0, fail = 0;
     g1(port, pass, fail);
     g2(port, pass, fail);
     g3(port, pass, fail);
     g4(port, pass, fail);
     g5(port, pass, fail);
-    std::cout << "[chat_room_test] PASS=" << pass << " FAIL=" << fail << (fail ? "\n" : "\n");
+    if(noHistory){
+        noHistoryCheck(port, pass, fail);           // 历史关闭回归路径（无需 kv）
+    } else {
+        g6(port, pass, fail);                        // 需服务端 --kv-path（regress 段 (6) 带 kv 启动）
+        g6b(port, pass, fail);
+    }
+    std::cout << "[chat_room_test] PASS=" << pass << " FAIL=" << fail << "\n";
     return fail > 0 ? 1 : 0;
 }

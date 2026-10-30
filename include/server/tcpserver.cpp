@@ -19,6 +19,9 @@ void TcpServer::setThreadNum(size_t n){
 void TcpServer::setMessageCallback(const MessageCallback& cb){
     codec_.setMessageCallback(cb);   // 业务层：收到一条完整消息时被调用
 }
+void TcpServer::setConnectionCallback(const ConnectionCallback& cb){
+    connectionCallback_ = cb;        // 连接生命周期挂点（可选；ioLoop 线程回调）
+}
 void TcpServer::setConnectionTimeout(double seconds){
     connectionTimeout_ = seconds;    // 存下；新建连接时透传
 }
@@ -44,6 +47,8 @@ void TcpServer::onNewConnection(int cfd){                 // 在 main loop 线�
             //    使对象永不析构、fd 永不 close → 连接不关 + fd 泄漏。
             // 只在回调栈内(对象仍活着)同步取 fd(int)，之后 runInLoop 不依赖对象存活。
             int cfd = c->fd();
+            // v2 presence：断线感知（连接归属的 ioLoop 线程回调）→ 业务层可立即广播离线
+            if(connectionCallback_) connectionCallback_(c, false);
             loop_->runInLoop([this, cfd]{ removeConnection(cfd); });
         });
         // 解析层挂钩：读到字节 → Codec 剥长度头切消息 → 业务 messageCallback
@@ -53,6 +58,8 @@ void TcpServer::onNewConnection(int cfd){                 // 在 main loop 线�
         if(conn->listenconnection()){                     // 上树发生在 ioLoop 的 epoll
             // 空闲超时：同样在 ioLoop 线程启动（TimerQueue 同线程调度），超时则由心跳关闭
             if(connectionTimeout_ > 0) conn->setConnectionTimeout(connectionTimeout_);
+            // v2 presence：新建上树成功（ioLoop 线程回调）→ 业务层可绑定连接资源
+            if(connectionCallback_) connectionCallback_(conn.get(), true);
             // 登记也拉回 main：conns_ 的插入/删除全走 main runInLoop 串行 → 无跨线程 race
             // insert 在 listenconnection 成功后立刻提交、close 只在其后同线程触发 → FIFO 保证先记后删
             loop_->runInLoop([this, cfd, conn]{

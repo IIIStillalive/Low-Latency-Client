@@ -14,6 +14,7 @@
 #   server_ack —— 绑定 127.0.0.1:8888（hardcode）
 #   rpc_server —— 8899（普通）+ 8898（--drop-ack 1，专供 T5）
 #   chat_server —— 8890，--threads 2（多 worker：聊天广播跨 loop 扇出路径的端到端验证）
+#         段 (6)/(6b)/(6c)：kv-history 开（G1–G6b）、重启持久化（seed/verify）、关闭兼容
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1      # 仓库根
@@ -99,6 +100,7 @@ cleanup() {
     stop_srv "$TMP/srv_rpc.pid"
     stop_srv "$TMP/srv_rpc_t5.pid"
     stop_srv "$TMP/srv_chat.pid"
+    stop_srv "$TMP/srv_im.pid"
 }
 trap cleanup EXIT
 
@@ -117,7 +119,8 @@ NEEDED="$BIN/client_protocol_test $BIN/server_ack $BIN/client_reliability_test \
         $BIN/client_delivery_test $BIN/client_reconnect_test \
         $BIN/rpc_server $BIN/rpc_client_test $BIN/rpc_pool_test \
         $BIN/rpc_pool_load_test $BIN/rpc_reconnect_rpc_test $BIN/rpc_bench \
-        $BIN/chat_server $BIN/chat_room_test"
+        $BIN/chat_server $BIN/chat_room_test \
+        $BIN/im_server $BIN/im_test"
 for b in $NEEDED; do
     if [ ! -x "$b" ]; then
         echo "ERROR: 缺少 $b —— 先跑 cmake -S . -B build && cmake --build build（RPC 目标需 protobuf）"
@@ -164,11 +167,59 @@ run_test rpc_reconnect_t5        180 "$BIN/rpc_reconnect_rpc_test" --port 8898 -
 stop_srv "$TMP/srv_rpc_t5.pid"
 
 echo
-echo "=== (6) Day10 聊天室真实业务（chat_server @8890，--threads 2 跨 loop 广播）==="
+echo "=== (6) Day10 聊天室真实业务（chat_server @8890，--threads 2 跨 loop 广播 + kv 历史）==="
+WAL_A="/tmp/chat_reg_a_$$.wal"
+rm -f "$WAL_A"
 start_srv chat_server 8890 "$TMP/srv_chat.pid" "$TMP/srv_chat.log" \
-         "$BIN/chat_server" --port 8890 --threads 2
+         "$BIN/chat_server" --port 8890 --threads 2 --kv-path "$WAL_A" --sync everysec
 run_test chat_room_test 120 "$BIN/chat_room_test" --port 8890
 stop_srv "$TMP/srv_chat.pid"
+
+echo
+echo "--- (6b) 重启持久化：--seed 3 → SIGTERM(优雅停机 flush) → 同 kv 重启 → --verify 3 ---"
+WAL_B="/tmp/chat_reg_b_$$.wal"
+rm -f "$WAL_B"
+start_srv chat_persist 8890 "$TMP/srv_chat.pid" "$TMP/srv_chat_p.log" \
+         "$BIN/chat_server" --port 8890 --threads 2 --kv-path "$WAL_B" --sync everysec
+run_test chat_room_seed 120 "$BIN/chat_room_test" --port 8890 --seed 3
+stop_srv "$TMP/srv_chat.pid"
+start_srv chat_persist 8890 "$TMP/srv_chat.pid" "$TMP/srv_chat_p.log" \
+         "$BIN/chat_server" --port 8890 --threads 2 --kv-path "$WAL_B" --sync everysec
+run_test chat_room_verify 120 "$BIN/chat_room_test" --port 8890 --verify 3
+stop_srv "$TMP/srv_chat.pid"
+
+echo
+echo "--- (6c) 历史关闭兼容：无 --kv-path → G1–G5 原样 + C2S_HISTORY 回 S2C_ERROR ---"
+start_srv chat_nokv 8890 "$TMP/srv_chat.pid" "$TMP/srv_chat_nokv.log" \
+         "$BIN/chat_server" --port 8890 --threads 2
+run_test chat_room_nohistory 120 "$BIN/chat_room_test" --port 8890 --nohistory
+stop_srv "$TMP/srv_chat.pid"
+
+rm -f "$WAL_A" "$WAL_B"   # /tmp 过程产物清理（WAL 缓存非交付物）
+
+echo
+echo "=== (7) v2 用户层 IM（im_server @8891，--threads 2 跨 loop 广播 + kv 全持久化）==="
+WAL_C="/tmp/im_reg_c_$$.wal"
+rm -f "$WAL_C"
+start_srv im_server 8891 "$TMP/srv_im.pid" "$TMP/srv_im.log" \
+         "$BIN/im_server" --port 8891 --threads 2 --kv-path "$WAL_C" --sync everysec
+run_test im_test 240 "$BIN/im_test" --port 8891
+stop_srv "$TMP/srv_im.pid"
+
+echo
+echo "--- (7b) v2 重启持久化：--seed9 3 → SIGTERM(优雅停机 flush) → 同 kv 重启 → --verify9 3 ---"
+WAL_D="/tmp/im_reg_d_$$.wal"
+rm -f "$WAL_D"
+start_srv im_persist 8891 "$TMP/srv_im.pid" "$TMP/srv_im_p.log" \
+         "$BIN/im_server" --port 8891 --threads 2 --kv-path "$WAL_D" --sync everysec
+run_test im_seed9 120 "$BIN/im_test" --port 8891 --seed9 3
+stop_srv "$TMP/srv_im.pid"
+start_srv im_persist 8891 "$TMP/srv_im.pid" "$TMP/srv_im_p.log" \
+         "$BIN/im_server" --port 8891 --threads 2 --kv-path "$WAL_D" --sync everysec
+run_test im_verify9 120 "$BIN/im_test" --port 8891 --verify9 3
+stop_srv "$TMP/srv_im.pid"
+
+rm -f "$WAL_C" "$WAL_D"
 
 echo
 echo "=== 汇总 ==="
