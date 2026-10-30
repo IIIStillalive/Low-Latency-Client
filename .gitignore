@@ -16,3 +16,6 @@ live.err
 # 临时验证脚本 / 编译产物
 test/
 test_wake
+
+# 设计文档（本地保留，不入库）
+plan/

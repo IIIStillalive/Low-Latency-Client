@@ -2,20 +2,20 @@
 
 *Qt6 IM Client × Muduo-Style Low-Latency IM Server*
 
-> 一个自研全链路的即时通讯系统。**主角是 Qt6 图形 IM 客户端**（Windows，无边框三栏、会话队列、气泡、未读角标、在线状态），底层连着一套自建 **多 Reactor** 网络内核上长出来的 IM 服务端（Linux / [WSL2]，kv 持久化）。协议、服务端、客户端全部在本仓库内端到端交付。
+> 一个即时通讯系统：**Qt6 图形 IM 客户端**（Windows，无边框三栏、会话队列、气泡、未读角标、在线状态）与 **多 Reactor** 网络内核上的 IM 服务端（Linux / [WSL2]，kv 持久化）同仓实现，协议到界面走同一套 v2 协议。
 
 **客户端 Target:** Windows · Qt6.11 (MinGW) · **服务端 Target:** Linux / [WSL2] (Ubuntu) · **Toolchain:** g++ 13 / MinGW g++ · CMake ≥ 3.16
 
 ---
 
-## 客户端：Qt6 类 QQ IM（本仓库主角）
+## 客户端：Qt6 类 QQ IM
 
 登录 → 三栏会话 IM：左功能条（56px）｜会话面板（280px：搜索 + 会话队列）｜聊天区 + 群成员栏（群聊专属）。
 
 ### 功能特性
 
 - **无边框标题栏** — `nativeEvent` 处理 `WM_NCHITTEST`：四边/四角 6px 返回系统缩放、标题栏区 `HTCAPTION`（系统级拖动 + 双击最大化）、右上按钮区 `HTCLIENT` 保持可点；最小化/最大化/关闭在自绘栏内。
-- **会话队列（v3 重写）** — 每行自绘 `ConvRow`：头像 + 昵称 + 最后消息预览 + 时间 + 未读角标（超过 99 显示 `99+`）。服务端 `0x93` 携带 `lastTsMs` 作为排序锚，会话按时间**降序**排列；`0x96` 新消息到达实时把对应会话**顶到队首**，不再静止在列表尾部。
+- **会话队列** — 每行自绘 `ConvRow`：头像 + 昵称 + 最后消息预览 + 时间 + 未读角标（超过 99 显示 `99+`）。服务端 `0x93` 携带 `lastTsMs` 作为排序锚，会话按时间**降序**排列；`0x96` 新消息到达实时把对应会话**顶到队首**。
 - **添加好友 / 用户** — ✚ 菜单 → 输入 uid → `0x1B` 查找用户、`0x9C` 回执 → 结果卡（头像 / 昵称 / uid）+「发起聊天」打开 DM；也可不查找直接按 uid 发起。**添加/发起自己被拦截**：对话框输入登录用户自己时红字拒绝，服务端 `0x12` 同样权威拒绝并回 `0x8F` 错误。
 - **气泡历史** — 自己/对方左右分栏、头像 + 昵称稳定取色（FNV-1a 哈希调色板，同一 uid 恒同色）；相邻消息间隔 >5 分钟自动插入居中时间线；滚动到顶触发按 seq 游标上翻补历史（200 条/批）。
 - **群聊** — 新建群聊（成员列表写进登录用户自己会被拒绝）/ 按群 id 入群（`grp:N`，幂等）均从 ✚ 菜单发起；右键群会话退群（DM 无退群）。群打开时右侧成员栏显示「成员 N · 在线 M」，`0x99` 快照 + `0x9A` 推送实时切换在线圆点。
@@ -61,7 +61,7 @@ qt/
 
 ## 服务端：低延迟 IM 服务端（放在最后介绍）
 
-客户端不是玩具——它连的是自研 **多 Reactor** 网络内核上实现的 IM 服务：[include/im/im_server.cpp](include/im/im_server.cpp) 承载全部会话/未读/在线/历史语义，beneath 是自建网络库。
+客户端连的是 **多 Reactor** 网络内核之上的 IM 服务，实现见 [include/im/im_server.cpp](include/im/im_server.cpp)：会话/未读/在线/历史语义走 kv 持久化，网络层为同仓内的多 Reactor 库。
 
 ### 一键起服务端（WSL）
 
@@ -87,11 +87,11 @@ cmake -S . -B build && cmake --build build -j
 | `0x18` 退群 / `0x19` 成员表 / `0x1A` 入群 | dm 退群/入群均拒 | `0x99` / `0x9A` | 成员表（含在线）/ 在线推送 |
 | `0x1B` 查找用户 / `0x9C` | 添加好友前校验存在 | `0x8F` 错误 | code+reason |
 
-### 多 Reactor 内核（自建网络库）
+### 多 Reactor 内核（网络层）
 
 - **分层架构**：`EventLoop`（eventfd 跨线程唤醒 + runInLoop）→ `ThreadPool`（每线程一个 loop，`getNextLoop()` 轮询接池）→ `Acceptor` / `TcpConnection` → `EpollPoller` / `Channel` / `Socket` / `Buffer`（`readv` 减拷贝）→ `LengthHeaderCodec`（半包/粘包切帧）→ `TimerQueue`（心跳/超时）。
 - **连接安全**：`TcpConnection` 继承 `enable_shared_from_this`，回调栈内局部共享指针保活防 UAF；连接容器 `conns_` 全部串行化在 main loop 线程消除 race；信号处理 async-signal-safe → 优雅停机连锁析构。
-- **性能**：批末写合并 + `TimerQueue::cancel` O(1)；RPC 客户端压测峰值约 7 万 QPS（归档报告见 `plan/bench_report.md`）。
+- **性能**：批末写合并 + `TimerQueue::cancel` O(1)；RPC 客户端压测峰值约 7 万 QPS。
 - **RPC 客户端（历史归档）**：protobuf 线格式 + req_id 关联 + Future/超时/取消 + 连接池多路复用 + 断线重连端到端幂等（Day5–Day9）。
 
 ### 测试
@@ -123,7 +123,7 @@ build-qt\qt_smoke.exe --host 127.0.0.1 --port 8891
 .
 ├── CMakeLists.txt
 ├── README.md
-├── qt/                    # Qt6 图形客户端（仓库主角，见上）
+├── qt/                    # Qt6 图形客户端（见上）
 ├── include/
 │   ├── net/  server/      # 多 Reactor 内核（EventLoop/ThreadPool/TcpConnection/…）
 │   ├── chat/              # v1 聊天室 + 跨端协议 message_proto.{hpp,cpp} + sha256（纯头）
@@ -132,7 +132,6 @@ build-qt\qt_smoke.exe --host 127.0.0.1 --port 8891
 ├── scripts/
 │   ├── regress.sh         # WSL 全量回归
 │   └── im_fill.py         # 灌历史消息（触顶翻页测试前置）
-├── plan/                  # 设计 / 任务分解 / 压测报告（task_plan_im_v2.md、task_plan_qt_v3_ui.md、…）
 └── proto/                 # RPC 线格式（protobuf，历史归档）
 ```
 
