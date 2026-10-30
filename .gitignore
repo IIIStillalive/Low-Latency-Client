@@ -19,3 +19,13 @@ test_wake
 
 # 设计文档（本地保留，不入库）
 plan/
+
+# Python 缓存
+scripts/__pycache__/
+
+# Qt Creator 本地配置
+qt/.qtcreator/
+
+# 个人简历（不入库）
+resume-zh.tex
+resume/
